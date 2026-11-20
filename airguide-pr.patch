@@ -1,0 +1,3089 @@
+From 7b40608260e388da9ace651520b12567a2d72931 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 04:44:58 +0000
+Subject: [PATCH 1/2] Add real-time air quality: pollutants, 24h forecast, live
+ panel, geolocation
+
+- data_source: O3/NO2/SO2/CO, observation time, main pollutant, hourly forecast,
+  coordinate lookup, one retry, serve-last-reading-if-API-down (<=3h)
+- insights: best time to go out (waking hours) and 6-hour trend
+- assistant: refresh live data each turn, explain stricter advice, keep location
+  typed alongside an AQI, user-supplied figures override live feed
+- server: GET /api/live, coords in /api/chat, Permissions-Policy for geolocation,
+  static max-age 24h -> 5min so UI updates reach browsers
+- web: live conditions panel, forecast chart, 10-min auto-refresh, "Use my location"
+- tests: 25 new (fake Open-Meteo payloads); full suite 70 passing
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013dt8LiRVaebM9pr7VP4C7T
+---
+ airguide-assistant/README.md               |  16 ++
+ airguide-assistant/airguide/assistant.py   | 105 +++++--
+ airguide-assistant/airguide/context.py     |  10 +
+ airguide-assistant/airguide/data_source.py | 313 +++++++++++++++------
+ airguide-assistant/airguide/insights.py    |  61 ++++
+ airguide-assistant/airguide/prompt.py      |   9 +-
+ airguide-assistant/airguide/server.py      |  81 +++++-
+ airguide-assistant/tests/fakes.py          |  30 ++
+ airguide-assistant/tests/test_live.py      | 195 +++++++++++++
+ airguide-assistant/tests/test_live_api.py  |  91 ++++++
+ airguide-assistant/web/app.js              | 156 +++++++++-
+ airguide-assistant/web/index.html          |  23 ++
+ airguide-assistant/web/style.css           |  36 +++
+ 13 files changed, 998 insertions(+), 128 deletions(-)
+ create mode 100644 airguide-assistant/airguide/insights.py
+ create mode 100644 airguide-assistant/tests/fakes.py
+ create mode 100644 airguide-assistant/tests/test_live.py
+ create mode 100644 airguide-assistant/tests/test_live_api.py
+
+diff --git a/airguide-assistant/README.md b/airguide-assistant/README.md
+index f3fd9d5..c4e9e55 100644
+--- a/airguide-assistant/README.md
++++ b/airguide-assistant/README.md
+@@ -230,3 +230,19 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
+    - `PORT`: `10000` (Render default)
+    - `HOST`: `0.0.0.0`
+ 5. Click **Deploy Web Service**.
++
++
++## Real-time data (v2)
++
++Live conditions come from the free [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api) (CAMS model, no API key).
++
++| Capability | Where |
++| --- | --- |
++| Current AQI, PM2.5, PM10, O3, NO2, SO2, CO + observation time | `airguide/data_source.py` |
++| 24-hour hourly AQI forecast, "best time to go out", 6-hour trend | `airguide/insights.py` |
++| City lookup **or** browser-shared coordinates ("Use my location") | `fetch_live`, `fetch_live_coords` |
++| 10-min reading cache, permanent geocode cache, one retry, serve-last-reading-if-API-down (up to 3 h) | `data_source.py` |
++| `GET /api/live?city=Delhi` or `?lat=..&lon=..` (rate limited, validated) | `airguide/server.py` |
++| Live panel with pollutants, forecast chart and 10-minute auto-refresh | `web/` |
++
++While a conversation is on live data, every turn refreshes the reading (served from cache when fresh). Typing your own AQI or PM figures switches the conversation back to your numbers.
+diff --git a/airguide-assistant/airguide/assistant.py b/airguide-assistant/airguide/assistant.py
+index 3514c7f..c250782 100644
+--- a/airguide-assistant/airguide/assistant.py
++++ b/airguide-assistant/airguide/assistant.py
+@@ -11,7 +11,13 @@ from typing import Callable
+ from . import llm
+ from .aqi import category
+ from .context import ACTIVITIES, SENSITIVE_GROUPS, UserContext, sanitize_location
+-from .data_source import DataSourceError, LiveReading, fetch_live
++from .data_source import (
++    DataSourceError,
++    LiveReading,
++    fetch_live_coords,
++    fetch_live,
++)
++from .insights import best_window, fmt_window, fmt_hour, trend
+ from .prompt import render_system_prompt
+ from .router import Directive, decide
+ 
+@@ -73,25 +79,25 @@ def _parse(message: str, ctx: UserContext) -> None:
+     for rx, attr in ((_PM25_RE, "pm25"), (_PM10_RE, "pm10")):
+         m = rx.search(text)
+         if m:
++            if ctx.source == "live":  # user-supplied figures replace the live feed
++                ctx.aqi_reported = ctx.pm25 = ctx.pm10 = None
+             setattr(ctx, attr, float(m.group(1)))
+             had_number = True
+-            ctx.source = ctx.source or "user"
++            ctx.source = "user"
+             ctx.fetch_failed = False
+-            if ctx.aqi_reported is not None and ctx.source == "live":
+-                ctx.aqi_reported = None  # recompute from user figures
+ 
+-    # 2. Parse location if no numerical reading was provided
+-    if not had_number:
+-        loc = None
+-        m = _LOC_RE.search(text)
+-        if m:
+-            loc = sanitize_location(m.group(1))
+-        elif ctx.awaiting == "air_reading" and not re.search(r"\d", text) and len(text) <= 40:
+-            loc = sanitize_location(_LEAD_RE.sub("", text.strip()).rstrip("?.! "))
+-        if loc:
+-            if loc != ctx.location:  # new place invalidates old readings
++    loc = None
++    m = _LOC_RE.search(text)
++    if m:
++        loc = sanitize_location(m.group(1))
++    elif not had_number and ctx.awaiting == "air_reading" and not re.search(r"\d", text) and len(text) <= 40:
++        loc = sanitize_location(_LEAD_RE.sub("", text.strip()).rstrip("?.! "))
++    if loc:
++        if loc != ctx.location:  # new place invalidates old readings
++            if not had_number:
+                 ctx.aqi_reported = ctx.pm25 = ctx.pm10 = None
+-            ctx.location = loc
++            ctx.lat = ctx.lon = None
++        ctx.location = loc
+ 
+     # 3. Parse sensitive health conditions (pre-compiled patterns)
+     found = tuple(g for g in SENSITIVE_GROUPS if _SENS_PATTERNS[g].search(lowered))
+@@ -116,7 +122,32 @@ def _apply_live(ctx: UserContext, reading: LiveReading) -> None:
+     ctx.fetch_failed = False
+ 
+ 
+-def fallback_reply(ctx: UserContext, directive: Directive) -> str:
++_GROUP_LABEL = {
++    "lung": "a lung condition",
++    "heart": "a heart condition",
++    "child": "a child",
++    "elderly": "age 65+",
++    "pregnant": "pregnancy",
++}
++
++
++def live_notes(ctx: UserContext, live: LiveReading | None) -> list[str]:
++    """Deterministic forecast-based tips (only for live data and outdoor plans)."""
++    if not live or not live.forecast or ctx.activity == "indoor" or ctx.aqi is None:
++        return []
++    notes = []
++    window = best_window(live.forecast)
++    if window and window.avg_aqi <= ctx.aqi - 10:
++        notes.append(
++            f"Best time to go out today: {fmt_window(window)} (forecast AQI about {window.avg_aqi})."
++        )
++    direction = trend(live.forecast)
++    if direction in ("improving", "worsening"):
++        notes.append(f"Next 6 hours: air quality is {direction}.")
++    return notes
++
++
++def fallback_reply(ctx: UserContext, directive: Directive, live: LiveReading | None = None) -> str:
+     """Generate high-clarity deterministic response text without LLM."""
+     if directive.action == "ASK":
+         prefix = ""
+@@ -125,12 +156,21 @@ def fallback_reply(ctx: UserContext, directive: Directive) -> str:
+         return prefix + directive.text.split("QUESTION_TO_ASK: ")[1].split("\n")[0]
+     aqi = ctx.aqi
+     where = ctx.location or "your area"
+-    source = "live data" if ctx.source == "live" else "your reading"
++    if ctx.source == "live":
++        source = "live data"
++        if live and live.observed_at:
++            source += f", updated {fmt_hour(live.observed_at)} local time"
++    else:
++        source = "your reading"
+     lines = [
+         f"AQI is {aqi} ({category(aqi)}) in {where}, from {source}. "
+         f"Plan: {directive.verdict.replace('_', ' ').lower()}."
+     ]
++    if ctx.sensitivity and (directive.effective_level or 0) > (directive.level or 0):
++        who = ", ".join(_GROUP_LABEL[g] for g in ctx.sensitivity)
++        lines.append(f"- Advice is stricter because of {who}.")
+     lines += [f"- {p}" for p in directive.points]
++    lines += [f"- {n}" for n in live_notes(ctx, live)]
+     lines.append(f"- Mask: {directive.mask}.")
+     return "\n".join(lines)
+ 
+@@ -142,9 +182,11 @@ class Reply:
+     text: str
+     state: UserContext
+     directive: Directive
++    live: LiveReading | None = None
+ 
+ 
+ Fetch = Callable[[str], LiveReading]
++CoordsFetch = Callable[[float, float], LiveReading]
+ 
+ 
+ def respond(
+@@ -152,6 +194,8 @@ def respond(
+     state: UserContext | None = None,
+     *,
+     live_fetch: Fetch | None = fetch_live,
++    coords_fetch: CoordsFetch | None = fetch_live_coords,
++    coords: tuple[float, float] | None = None,
+     use_llm: bool = True,
+ ) -> Reply:
+     """Orchestrate the end-to-end assistant turn.
+@@ -170,11 +214,26 @@ def respond(
+ 
+     _parse(message, ctx)
+ 
+-    if ctx.location and ctx.aqi is None and live_fetch and not ctx.fetch_failed:
++    if coords is not None and (ctx.lat, ctx.lon) != coords:  # user shared a new position
++        ctx.aqi_reported = ctx.pm25 = ctx.pm10 = None
++        ctx.lat, ctx.lon = coords
++        ctx.location, ctx.source, ctx.fetch_failed = "Your location", None, False
++
++    # Fetch when we have no reading, and refresh on every turn while on live data
++    # (the client caches for 10 minutes, so this stays cheap and always current).
++    live: LiveReading | None = None
++    if ctx.location and not ctx.fetch_failed and (ctx.aqi is None or ctx.source == "live"):
+         try:
+-            _apply_live(ctx, live_fetch(ctx.location))
++            if ctx.lat is not None and ctx.lon is not None:
++                if coords_fetch:
++                    live = coords_fetch(ctx.lat, ctx.lon)
++            elif live_fetch:
++                live = live_fetch(ctx.location)
++            if live:
++                _apply_live(ctx, live)
+         except DataSourceError:
+-            ctx.fetch_failed = True
++            if ctx.aqi is None:  # keep the last good reading on a transient failure
++                ctx.fetch_failed = True
+ 
+     directive = decide(ctx)
+     ctx.awaiting = directive.ask_field
+@@ -182,7 +241,7 @@ def respond(
+ 
+     text = None
+     if use_llm and llm.enabled():
+-        text = llm.generate(render_system_prompt(ctx, directive), message)
++        text = llm.generate(render_system_prompt(ctx, directive, live_notes(ctx, live)), message)
+     if text is None:
+-        text = fallback_reply(ctx, directive)
+-    return Reply(text, ctx, directive)
++        text = fallback_reply(ctx, directive, live)
++    return Reply(text, ctx, directive, live)
+diff --git a/airguide-assistant/airguide/context.py b/airguide-assistant/airguide/context.py
+index 16c1415..035727f 100644
+--- a/airguide-assistant/airguide/context.py
++++ b/airguide-assistant/airguide/context.py
+@@ -59,6 +59,8 @@ class UserContext:
+     awaiting: str | None = None  # Field currently being asked to the user
+     stage: str = "gathering"
+     fetch_failed: bool = False
++    lat: float | None = None  # set when the user shares their location
++    lon: float | None = None
+ 
+     @property
+     def aqi(self) -> int | None:
+@@ -80,6 +82,8 @@ class UserContext:
+             "awaiting": self.awaiting,
+             "stage": self.stage,
+             "fetch_failed": self.fetch_failed,
++            "lat": self.lat,
++            "lon": self.lon,
+         }
+ 
+     @classmethod
+@@ -95,6 +99,10 @@ class UserContext:
+         activity = data.get("activity")
+         awaiting = data.get("awaiting")
+         source = data.get("source")
++        lat = _bounded_float(data.get("lat"), -90, 90)
++        lon = _bounded_float(data.get("lon"), -180, 180)
++        if lat is None or lon is None:
++            lat = lon = None
+         return cls(
+             location=sanitize_location(data.get("location")),
+             aqi_reported=None if aqi is None else int(aqi),
+@@ -106,6 +114,8 @@ class UserContext:
+             awaiting=awaiting if awaiting in ASK_FIELDS else None,
+             stage="advising" if data.get("stage") == "advising" else "gathering",
+             fetch_failed=bool(data.get("fetch_failed")),
++            lat=lat,
++            lon=lon,
+         )
+ 
+     def prompt_fields(self) -> dict[str, str]:
+diff --git a/airguide-assistant/airguide/data_source.py b/airguide-assistant/airguide/data_source.py
+index 003e032..b33ed21 100644
+--- a/airguide-assistant/airguide/data_source.py
++++ b/airguide-assistant/airguide/data_source.py
+@@ -1,10 +1,13 @@
+-"""Optional live air-quality lookup via Open-Meteo with high-performance in-memory caching.
++"""Real-time air-quality data via Open-Meteo (free, no API key).
+ 
+ Zero external dependencies (pure standard library).
+ Features:
+-- Permanent geocoding coordinate cache (city coordinates never change).
+-- 10-minute TTL air quality cache (reduces redundant network requests).
+-- Outbound request bounds (8s timeout, 200KB payload cap, HTTPS enforcement).
++- Current pollutants (PM2.5, PM10, O3, NO2, SO2, CO) plus a 24-hour hourly AQI forecast.
++- Permanent geocoding cache (city coordinates never change).
++- 10-minute TTL reading cache; on upstream failure the last reading (up to 3 h old)
++  is served instead of an error.
++- Outbound request bounds (8 s timeout, one retry, 200 KB payload cap, HTTPS only).
++- Lookup by city name or by browser-shared coordinates.
+ """
+ from __future__ import annotations
+ 
+@@ -13,62 +16,102 @@ import time
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import Any, Callable
+ 
++from .aqi import PM10_BREAKPOINTS, PM25_BREAKPOINTS, sub_index
++
+ GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+ AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
++PROVIDER = "Open-Meteo Air Quality (CAMS)"
+ TIMEOUT_S = 8.0
+ MAX_BYTES = 200_000
+-DEFAULT_CACHE_TTL_S = 600.0  # 10 minutes cache for atmospheric readings
++RETRIES = 1
++DEFAULT_CACHE_TTL_S = 600.0  # 10 minutes for atmospheric readings
++STALE_OK_S = 3 * 3600.0      # serve a cached reading this old if the API is down
++CACHE_MAX = 256
++FORECAST_HOURS = 24
++CURRENT_FIELDS = "us_aqi,pm10,pm2_5,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide"
+ 
+ Fetcher = Callable[[str], dict[str, Any]]
+ 
+ 
++class DataSourceError(Exception):
++    """Raised when an external data fetch or parsing fails."""
++
++
++class LocationNotFound(DataSourceError):
++    """Raised when geocoding finds no matching place."""
++
++
+ @dataclass(frozen=True)
+ class LiveReading:
+-    """Represents a validated atmospheric observation."""
++    """A validated atmospheric observation with optional forecast."""
+ 
+     place: str
+     aqi: int | None
+     pm25: float | None
+     pm10: float | None
+     cached: bool = False
++    observed_at: str | None = None  # local time at the location, "YYYY-MM-DDTHH:MM"
++    ozone: float | None = None
++    no2: float | None = None
++    so2: float | None = None
++    co: float | None = None
++    dominant: str | None = None
++    lat: float | None = None
++    lon: float | None = None
++    forecast: tuple[tuple[str, int], ...] = ()  # (local ISO hour, US AQI), starting now
++    provider: str = PROVIDER
+ 
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "place": self.place, "aqi": self.aqi, "pm25": self.pm25, "pm10": self.pm10,
++            "ozone": self.ozone, "no2": self.no2, "so2": self.so2, "co": self.co,
++            "dominant": self.dominant, "observed_at": self.observed_at,
++            "lat": self.lat, "lon": self.lon, "cached": self.cached,
++            "forecast": [{"time": t, "aqi": a} for t, a in self.forecast],
++            "provider": self.provider,
++        }
+ 
+-class DataSourceError(Exception):
+-    """Raised when an external data fetch or parsing fails."""
+-
+-    pass
+ 
+-
+-# High-efficiency in-memory caches to minimize latency & external bandwidth
++# In-memory caches (thread-safety: single-key dict ops are atomic under the GIL)
+ _GEO_CACHE: dict[str, tuple[float, float, str]] = {}
+-_READING_CACHE: dict[str, tuple[float, LiveReading]] = {}  # key -> (timestamp, LiveReading)
++_READING_CACHE: dict[str, tuple[float, LiveReading]] = {}
++_STATS = {"hits": 0, "misses": 0, "stale_served": 0}
+ 
+ 
+ def clear_caches() -> None:
+-    """Flush all in-memory geocoding and reading caches (useful for testing)."""
++    """Flush all in-memory caches (useful for testing)."""
+     _GEO_CACHE.clear()
+     _READING_CACHE.clear()
++    for k in _STATS:
++        _STATS[k] = 0
++
++
++def cache_stats() -> dict[str, int]:
++    return {"readings": len(_READING_CACHE), "places": len(_GEO_CACHE), **_STATS}
+ 
+ 
+ def http_get_json(url: str) -> dict[str, Any]:
+-    """Execute a secure, bounded HTTPS GET request returning parsed JSON."""
++    """Secure, bounded HTTPS GET returning parsed JSON (one retry on network faults)."""
+     if not url.startswith("https://"):
+         raise DataSourceError("only https is allowed")
+     req = urllib.request.Request(
+-        url,
+-        headers={
+-            "User-Agent": "airguide-assistant/1.0",
+-            "Accept": "application/json",
+-        },
++        url, headers={"User-Agent": "airguide-assistant/2.0", "Accept": "application/json"}
+     )
+-    try:
+-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:  # noqa: S310
+-            raw = resp.read(MAX_BYTES + 1)
+-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+-        raise DataSourceError(str(exc)) from exc
++    last: Exception | None = None
++    for attempt in range(RETRIES + 1):
++        try:
++            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:  # noqa: S310
++                raw = resp.read(MAX_BYTES + 1)
++            break
++        except (urllib.error.URLError, TimeoutError, OSError) as exc:
++            last = exc
++            if attempt < RETRIES:
++                time.sleep(0.4)
++    else:
++        raise DataSourceError(str(last)) from last
+     if len(raw) > MAX_BYTES:
+         raise DataSourceError("response too large")
+     try:
+@@ -80,76 +123,53 @@ def http_get_json(url: str) -> dict[str, Any]:
+     return data
+ 
+ 
+-def _num(value: Any) -> float | None:
+-    """Safely convert numeric values, rejecting booleans, strings and nulls."""
++# ------------------------------------------------------------------------ parsing
++def _num(value) -> float | None:
+     if isinstance(value, bool) or not isinstance(value, (int, float)):
+         return None
++    if value != value:  # NaN
++        return None
+     return float(value)
+ 
+ 
+-def fetch_live(
+-    city: str,
+-    fetcher: Fetcher = http_get_json,
+-    ttl: float = DEFAULT_CACHE_TTL_S,
+-    use_cache: bool = True,
+-) -> LiveReading:
+-    """Geocode `city` then fetch current readings with intelligent caching.
++def _clamp_aqi(value: float) -> int:
++    return max(0, min(500, round(value)))
+ 
+-    Args:
+-        city: The place name to look up.
+-        fetcher: HTTP JSON fetching callable (defaults to http_get_json).
+-        ttl: Time-to-live in seconds for cached air quality readings.
+-        use_cache: If True, uses geocoding and air reading cache.
+ 
+-    Returns:
+-        LiveReading with verified place, AQI, PM2.5, and PM10 figures.
++def _dominant(aqi: int | None, pm25: float | None, pm10: float | None) -> str | None:
++    subs = {}
++    if pm25 is not None:
++        subs["PM2.5"] = sub_index(pm25, PM25_BREAKPOINTS, 1)
++    if pm10 is not None:
++        subs["PM10"] = sub_index(pm10, PM10_BREAKPOINTS, 0)
++    if aqi is None or not subs:
++        return None
++    name, value = max(subs.items(), key=lambda kv: kv[1])
++    return name if value >= aqi - 5 else "Ozone / gases"
+ 
+-    Raises:
+-        DataSourceError: On lookup failure, network timeout, or invalid format.
+-    """
+-    clean_city = city.strip()
+-    cache_key = clean_city.lower()
+-    now = time.monotonic()
+ 
+-    # Check reading cache first (instant response in <0.1ms)
+-    if use_cache and cache_key in _READING_CACHE:
+-        cached_time, cached_reading = _READING_CACHE[cache_key]
+-        if now - cached_time < ttl:
+-            return LiveReading(
+-                place=cached_reading.place,
+-                aqi=cached_reading.aqi,
+-                pm25=cached_reading.pm25,
+-                pm10=cached_reading.pm10,
+-                cached=True,
+-            )
++def _forecast(air: dict, observed_at: str | None) -> tuple[tuple[str, int], ...]:
++    hourly = air.get("hourly")
++    if not isinstance(hourly, dict):
++        return ()
++    times, values = hourly.get("time"), hourly.get("us_aqi")
++    if not isinstance(times, list) or not isinstance(values, list):
++        return ()
++    start = observed_at[:13] if observed_at else None
++    rows: list[tuple[str, int]] = []
++    for t, v in zip(times, values):
++        n = _num(v)
++        if not isinstance(t, str) or n is None:
++            continue
++        if start and t[:13] < start:  # ISO strings sort chronologically
++            continue
++        rows.append((t[:16], _clamp_aqi(n)))
++        if len(rows) >= FORECAST_HOURS:
++            break
++    return tuple(rows)
+ 
+-    # 1. Geocode city (with permanent coordinate cache)
+-    if use_cache and cache_key in _GEO_CACHE:
+-        lat, lon, place = _GEO_CACHE[cache_key]
+-    else:
+-        geo = fetcher(
+-            f"{GEOCODE_URL}?{urllib.parse.urlencode({'name': clean_city, 'count': 1})}"
+-        )
+-        results = geo.get("results")
+-        if not isinstance(results, list) or not results:
+-            raise DataSourceError("location not found")
+-        top = results[0]
+-        lat_val = _num(top.get("latitude"))
+-        lon_val = _num(top.get("longitude"))
+-        if lat_val is None or lon_val is None:
+-            raise DataSourceError("bad coordinates")
+-        lat, lon = lat_val, lon_val
+-        place = ", ".join(
+-            p for p in (top.get("name"), top.get("country")) if isinstance(p, str)
+-        ) or clean_city
+-        if use_cache:
+-            _GEO_CACHE[cache_key] = (lat, lon, place)
+-
+-    # 2. Fetch atmospheric data
+-    query = urllib.parse.urlencode(
+-        {"latitude": lat, "longitude": lon, "current": "pm10,pm2_5,us_aqi"}
+-    )
+-    air = fetcher(f"{AIR_URL}?{query}")
++
++def _parse_air(place: str, lat: float, lon: float, air: dict) -> LiveReading:
+     current = air.get("current")
+     if not isinstance(current, dict):
+         raise DataSourceError("no current data")
+@@ -157,16 +177,125 @@ def fetch_live(
+     pm25, pm10 = _num(current.get("pm2_5")), _num(current.get("pm10"))
+     if aqi is None and pm25 is None and pm10 is None:
+         raise DataSourceError("no usable readings")
+-
+-    reading = LiveReading(
++    aqi_i = None if aqi is None else _clamp_aqi(aqi)
++    t = current.get("time")
++    observed = t[:16] if isinstance(t, str) else None
++    return LiveReading(
+         place=place,
+-        aqi=None if aqi is None else max(0, min(500, round(aqi))),
++        aqi=aqi_i,
+         pm25=pm25,
+         pm10=pm10,
+-        cached=False,
++        observed_at=observed,
++        ozone=_num(current.get("ozone")),
++        no2=_num(current.get("nitrogen_dioxide")),
++        so2=_num(current.get("sulphur_dioxide")),
++        co=_num(current.get("carbon_monoxide")),
++        dominant=_dominant(aqi_i, pm25, pm10),
++        lat=lat,
++        lon=lon,
++        forecast=_forecast(air, observed),
+     )
+ 
+-    if use_cache:
+-        _READING_CACHE[cache_key] = (now, reading)
+ 
++def _air_url(lat: float, lon: float) -> str:
++    return AIR_URL + "?" + urllib.parse.urlencode(
++        {
++            "latitude": f"{lat:.4f}",
++            "longitude": f"{lon:.4f}",
++            "current": CURRENT_FIELDS,
++            "hourly": "us_aqi",
++            "forecast_days": 2,
++            "timezone": "auto",
++        }
++    )
++
++
++def valid_coords(lat: Any, lon: Any) -> tuple[float, float] | None:
++    la, lo = _num(lat), _num(lon)
++    if la is None or lo is None or not (-90 <= la <= 90) or not (-180 <= lo <= 180):
++        return None
++    return la, lo
++
++
++# ---------------------------------------------------------------- cached fetching
++def _cached_reading(
++    key: str, ttl: float, use_cache: bool, loader: Callable[[], LiveReading]
++) -> LiveReading:
++    now = time.monotonic()
++    item = _READING_CACHE.get(key) if use_cache else None
++    if item and now - item[0] < ttl:
++        _STATS["hits"] += 1
++        return replace(item[1], cached=True)
++    _STATS["misses"] += 1
++    try:
++        reading = loader()
++    except LocationNotFound:
++        raise
++    except DataSourceError:
++        if item and now - item[0] <= STALE_OK_S:  # upstream down: serve last good data
++            _STATS["stale_served"] += 1
++            return replace(item[1], cached=True)
++        raise
++    if use_cache:
++        if len(_READING_CACHE) >= CACHE_MAX:
++            del _READING_CACHE[min(_READING_CACHE, key=lambda k: _READING_CACHE[k][0])]
++        _READING_CACHE[key] = (now, reading)
+     return reading
++
++
++def fetch_live(
++    city: str,
++    fetcher: Fetcher = http_get_json,
++    ttl: float = DEFAULT_CACHE_TTL_S,
++    use_cache: bool = True,
++) -> LiveReading:
++    """Geocode `city` then fetch current readings and the hourly forecast.
++
++    Raises DataSourceError (LocationNotFound when the place is unknown).
++    """
++    clean_city = city.strip()
++    cache_key = "c:" + " ".join(clean_city.lower().split())
++
++    def load() -> LiveReading:
++        geo_key = cache_key
++        if use_cache and geo_key in _GEO_CACHE:
++            lat, lon, place = _GEO_CACHE[geo_key]
++        else:
++            geo = fetcher(
++                f"{GEOCODE_URL}?{urllib.parse.urlencode({'name': clean_city, 'count': 1, 'language': 'en'})}"
++            )
++            results = geo.get("results")
++            if not isinstance(results, list) or not results:
++                raise LocationNotFound("location not found")
++            top = results[0]
++            coords = valid_coords(top.get("latitude"), top.get("longitude"))
++            if coords is None:
++                raise DataSourceError("bad coordinates")
++            lat, lon = coords
++            place = ", ".join(
++                p for p in (top.get("name"), top.get("country")) if isinstance(p, str)
++            ) or clean_city
++            if use_cache:
++                _GEO_CACHE[geo_key] = (lat, lon, place)
++        return _parse_air(place, lat, lon, fetcher(_air_url(lat, lon)))
++
++    return _cached_reading(cache_key, ttl, use_cache, load)
++
++
++def fetch_live_coords(
++    lat: float,
++    lon: float,
++    label: str = "Your location",
++    fetcher: Fetcher = http_get_json,
++    ttl: float = DEFAULT_CACHE_TTL_S,
++    use_cache: bool = True,
++) -> LiveReading:
++    """Fetch readings for exact coordinates (e.g. shared by the browser)."""
++    coords = valid_coords(lat, lon)
++    if coords is None:
++        raise DataSourceError("bad coordinates")
++    key = f"g:{round(coords[0], 2)}:{round(coords[1], 2)}"
++    reading = _cached_reading(
++        key, ttl, use_cache, lambda: _parse_air(label, coords[0], coords[1], fetcher(_air_url(*coords)))
++    )
++    return reading if reading.place == label else replace(reading, place=label)
+diff --git a/airguide-assistant/airguide/insights.py b/airguide-assistant/airguide/insights.py
+new file mode 100644
+index 0000000..800f621
+--- /dev/null
++++ b/airguide-assistant/airguide/insights.py
+@@ -0,0 +1,61 @@
++"""Deterministic insights derived from the hourly forecast (no LLM involved)."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime, timedelta
++
++DAY_START_H, DAY_END_H = 5, 22  # only suggest sensible waking hours
++
++
++@dataclass(frozen=True)
++class Window:
++    start: str  # local ISO hour
++    end: str    # local ISO hour (exclusive)
++    avg_aqi: int
++
++
++def _dt(iso: str) -> datetime:
++    return datetime.strptime(iso[:16], "%Y-%m-%dT%H:%M")
++
++
++def fmt_hour(iso: str) -> str:
++    d = _dt(iso)
++    h = d.hour % 12 or 12
++    return f"{h} {'AM' if d.hour < 12 else 'PM'}"
++
++
++def fmt_window(w: Window) -> str:
++    return f"{fmt_hour(w.start)}–{fmt_hour(w.end)}"
++
++
++def best_window(forecast, width: int = 2, horizon: int = 18) -> Window | None:
++    """Lowest-average `width`-hour block in waking hours within the horizon."""
++    rows = list(forecast)[:horizon]
++    best: Window | None = None
++    for i in range(len(rows) - width + 1):
++        block = rows[i : i + width]
++        hours = [_dt(t).hour for t, _ in block]
++        if not all(DAY_START_H <= h < DAY_END_H for h in hours):
++            continue
++        # must be consecutive hours
++        if any(_dt(block[j + 1][0]) - _dt(block[j][0]) != timedelta(hours=1) for j in range(width - 1)):
++            continue
++        avg = round(sum(a for _, a in block) / width)
++        if best is None or avg < best.avg_aqi:
++            end = (_dt(block[-1][0]) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M")
++            best = Window(block[0][0], end, avg)
++    return best
++
++
++def trend(forecast, hours: int = 6, threshold: int = 10) -> str | None:
++    """'improving' | 'worsening' | 'steady' over the next `hours`, or None."""
++    rows = list(forecast)
++    if len(rows) < 3:
++        return None
++    ahead = [a for _, a in rows[1 : hours + 1]]
++    delta = sum(ahead) / len(ahead) - rows[0][1]
++    if delta <= -threshold:
++        return "improving"
++    if delta >= threshold:
++        return "worsening"
++    return "steady"
+diff --git a/airguide-assistant/airguide/prompt.py b/airguide-assistant/airguide/prompt.py
+index 421f413..bf013a2 100644
+--- a/airguide-assistant/airguide/prompt.py
++++ b/airguide-assistant/airguide/prompt.py
+@@ -46,7 +46,12 @@ to seek urgent medical care immediately.
+ """
+ 
+ 
+-def render_system_prompt(ctx: UserContext, directive: Directive) -> str:
++def render_system_prompt(
++    ctx: UserContext, directive: Directive, live_notes: list[str] | None = None
++) -> str:
+     """Render the guardrailed system prompt populated with validated dynamic state."""
+     fields = ctx.prompt_fields()
+-    return SYSTEM_PROMPT.format(routing_directive=directive.text, **fields)
++    text = directive.text
++    if live_notes:  # forecast tips computed by the backend, not by the model
++        text += "\nLIVE_FORECAST_NOTES: " + " | ".join(live_notes)
++    return SYSTEM_PROMPT.format(routing_directive=text, **fields)
+diff --git a/airguide-assistant/airguide/server.py b/airguide-assistant/airguide/server.py
+index 3483bf2..c9ba877 100644
+--- a/airguide-assistant/airguide/server.py
++++ b/airguide-assistant/airguide/server.py
+@@ -19,10 +19,20 @@ from collections import defaultdict, deque
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+ from typing import Any, Callable
++from urllib.parse import parse_qs, urlsplit
+ 
+ from . import llm
+ from .assistant import respond
+-from .context import UserContext
++from .context import UserContext, sanitize_location
++from .data_source import (
++    PROVIDER,
++    DataSourceError,
++    LocationNotFound,
++    cache_stats,
++    fetch_live,
++    fetch_live_coords,
++    valid_coords,
++)
+ 
+ logger = logging.getLogger("airguide")
+ if not logger.handlers:
+@@ -43,6 +53,7 @@ BASE_SECURITY_HEADERS: dict[str, str] = {
+     "X-Content-Type-Options": "nosniff",
+     "X-Frame-Options": "DENY",
+     "Referrer-Policy": "no-referrer",
++    "Permissions-Policy": "geolocation=(self), camera=(), microphone=()",
+ }
+ 
+ # Pre-load static assets into memory with calculated ETags for maximum I/O efficiency
+@@ -67,6 +78,13 @@ def _init_static_cache() -> None:
+ _init_static_cache()
+ 
+ 
++def _to_float(value: Any) -> float | None:
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return None
++
++
+ class RateLimiter:
+     """Thread-safe sliding-window rate limiter with automatic memory cleanup."""
+ 
+@@ -102,10 +120,17 @@ def build_handler(
+     live_fetch: Any = None,
+     use_llm: bool = True,
+     limiter: RateLimiter | None = None,
++    coords_fetch: Any = None,
+ ) -> type[BaseHTTPRequestHandler]:
+     """Construct a configured HTTP handler class."""
+     rate_limiter = limiter or RateLimiter()
+-    kwargs: dict[str, Any] = {} if live_fetch is None else {"live_fetch": live_fetch}
++    kwargs: dict[str, Any] = {}
++    if live_fetch is not None:
++        kwargs["live_fetch"] = live_fetch
++    if coords_fetch is not None:
++        kwargs["coords_fetch"] = coords_fetch
++    by_city = live_fetch or fetch_live
++    by_coords = coords_fetch or fetch_live_coords
+ 
+     class Handler(BaseHTTPRequestHandler):
+         server_version = "AirGuide/1.0"
+@@ -146,7 +171,17 @@ def build_handler(
+         def do_GET(self) -> None:
+             path = self.path.split("?", 1)[0]
+             if path == "/healthz":
+-                return self._json(200, {"status": "ok", "provider": llm.active_provider()})
++                return self._json(
++                    200,
++                    {
++                        "status": "ok",
++                        "provider": llm.active_provider(),
++                        "live_data": PROVIDER,
++                        "cache": cache_stats(),
++                    },
++                )
++            if path == "/api/live":
++                return self._live()
+ 
+             entry = STATIC_ASSETS.get(path)
+             if not entry:
+@@ -157,7 +192,7 @@ def build_handler(
+             if self.headers.get("If-None-Match") == etag:
+                 self.send_response(304)
+                 self.send_header("ETag", etag)
+-                self.send_header("Cache-Control", "public, max-age=86400, stale-while-revalidate=3600")
++                self.send_header("Cache-Control", "public, max-age=300, stale-while-revalidate=3600")
+                 for k, v in BASE_SECURITY_HEADERS.items():
+                     self.send_header(k, v)
+                 self.end_headers()
+@@ -169,10 +204,37 @@ def build_handler(
+                 ctype,
+                 {
+                     "ETag": etag,
+-                    "Cache-Control": "public, max-age=86400, stale-while-revalidate=3600",
++                    "Cache-Control": "public, max-age=300, stale-while-revalidate=3600",
+                 },
+             )
+ 
++        def _live(self) -> None:
++            """GET /api/live?city=Delhi  or  /api/live?lat=28.6&lon=77.2"""
++            client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
++            if not rate_limiter.allow(client_ip):
++                return self._json(429, {"error": "Too many requests. Please wait a moment."})
++            q = parse_qs(urlsplit(self.path).query)
++
++            def first(key: str) -> str | None:
++                return (q.get(key) or [None])[0]
++
++            try:
++                if first("city") is not None:
++                    city = sanitize_location(first("city"))
++                    if not city:
++                        return self._json(400, {"error": "invalid city"})
++                    reading = by_city(city)
++                else:
++                    coords = valid_coords(_to_float(first("lat")), _to_float(first("lon")))
++                    if coords is None:
++                        return self._json(400, {"error": "provide city or valid lat/lon"})
++                    reading = by_coords(*coords)
++            except LocationNotFound:
++                return self._json(404, {"error": "Location not found."})
++            except DataSourceError:
++                return self._json(502, {"error": "Live air-quality data is temporarily unavailable."})
++            self._json(200, {"live": reading.to_dict()})
++
+         def do_POST(self) -> None:
+             if self.path != "/api/chat":
+                 return self._json(404, {"error": "not found"})
+@@ -197,7 +259,13 @@ def build_handler(
+                 return self._json(400, {"error": "expected {message: string, state: object}"})
+ 
+             state = UserContext.from_dict(data.get("state"))
+-            reply = respond(message, state, use_llm=use_llm, **kwargs)
++            coords = None
++            raw_coords = data.get("coords")
++            if isinstance(raw_coords, dict):
++                coords = valid_coords(raw_coords.get("lat"), raw_coords.get("lon"))
++                if coords:
++                    coords = (round(coords[0], 4), round(coords[1], 4))
++            reply = respond(message, state, use_llm=use_llm, coords=coords, **kwargs)
+             d = reply.directive
+             aqi = reply.state.aqi
+             self._json(
+@@ -210,6 +278,7 @@ def build_handler(
+                         "verdict": d.verdict,
+                         "location": reply.state.location,
+                     },
++                    "live": reply.live.to_dict() if reply.live else None,
+                     "provider": llm.active_provider(),
+                 },
+             )
+diff --git a/airguide-assistant/tests/fakes.py b/airguide-assistant/tests/fakes.py
+new file mode 100644
+index 0000000..68e7eed
+--- /dev/null
++++ b/airguide-assistant/tests/fakes.py
+@@ -0,0 +1,30 @@
++"""Realistic Open-Meteo payloads for offline tests."""
++from datetime import datetime, timedelta
++
++
++def hourly_series(start="2026-11-19T00:00", hours=48, shape=None):
++    t0 = datetime.strptime(start, "%Y-%m-%dT%H:%M")
++    times = [(t0 + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M") for i in range(hours)]
++    shape = shape or (lambda h: 170 if 7 <= h <= 11 else 120 if 12 <= h <= 15 else 70 if 16 <= h <= 20 else 140)
++    return {"time": times, "us_aqi": [shape(datetime.strptime(t, "%Y-%m-%dT%H:%M").hour) for t in times]}
++
++
++def open_meteo(calls=None, fail_air=False):
++    def fetch(url):
++        if calls is not None:
++            calls.append(url)
++        if "geocoding" in url:
++            if "zzz" in url:
++                return {}
++            return {"results": [{"name": "Delhi", "country": "India", "latitude": 28.65, "longitude": 77.23}]}
++        if fail_air:
++            from airguide.data_source import DataSourceError
++            raise DataSourceError("upstream down")
++        return {
++            "timezone": "Asia/Kolkata",
++            "current": {"time": "2026-11-19T14:00", "interval": 3600, "us_aqi": 168,
++                        "pm10": 140.0, "pm2_5": 80.0, "ozone": 45.0,
++                        "nitrogen_dioxide": 38.5, "sulphur_dioxide": 12.0, "carbon_monoxide": 640.0},
++            "hourly": hourly_series(),
++        }
++    return fetch
+diff --git a/airguide-assistant/tests/test_live.py b/airguide-assistant/tests/test_live.py
+new file mode 100644
+index 0000000..2f3d58a
+--- /dev/null
++++ b/airguide-assistant/tests/test_live.py
+@@ -0,0 +1,195 @@
++import time
++import unittest
++
++from airguide.assistant import respond
++from airguide.context import UserContext
++from unittest import mock
++
++from airguide.data_source import (
++    DataSourceError, LocationNotFound, cache_stats, clear_caches, fetch_live, fetch_live_coords, valid_coords,
++)
++from airguide.insights import Window, best_window, fmt_hour, fmt_window, trend
++
++from tests.fakes import hourly_series, open_meteo
++
++
++class ParseTests(unittest.TestCase):
++    def setUp(self):
++        clear_caches()
++
++    def test_full_reading(self):
++        r = fetch_live("Delhi", open_meteo())
++        self.assertEqual((r.place, r.aqi, r.pm25, r.pm10), ("Delhi, India", 168, 80.0, 140.0))
++        self.assertEqual((r.ozone, r.no2, r.so2, r.co), (45.0, 38.5, 12.0, 640.0))
++        self.assertEqual(r.observed_at, "2026-11-19T14:00")
++        self.assertEqual(r.dominant, "PM2.5")
++        self.assertEqual(len(r.forecast), 24)
++        self.assertEqual(r.forecast[0][0], "2026-11-19T14:00")  # starts at "now"
++        self.assertEqual(r.to_dict()["forecast"][0], {"time": "2026-11-19T14:00", "aqi": 120})
++
++    def test_missing_hourly_and_extras_is_ok(self):
++        def f(url):
++            if "geocoding" in url:
++                return {"results": [{"name": "X", "latitude": 1, "longitude": 2}]}
++            return {"current": {"us_aqi": 50}}
++        r = fetch_live("X", f)
++        self.assertEqual((r.aqi, r.forecast, r.ozone, r.observed_at), (50, (), None, None))
++
++    def test_errors(self):
++        with self.assertRaises(LocationNotFound):
++            fetch_live("zzz", open_meteo())
++        with self.assertRaises(DataSourceError):
++            fetch_live_coords(95, 0, fetcher=open_meteo())
++        self.assertIsNone(valid_coords("a", 1))
++        self.assertIsNone(valid_coords(0, 181))
++
++    def test_requests_hourly_and_timezone(self):
++        calls = []
++        fetch_live("Delhi", open_meteo(calls))
++        air = [c for c in calls if "air-quality" in c][0]
++        for needle in ("hourly=us_aqi", "timezone=auto", "ozone", "nitrogen_dioxide"):
++            self.assertIn(needle, air)
++
++    def test_gas_driven_dominant(self):
++        def f(url):
++            if "geocoding" in url:
++                return {"results": [{"name": "X", "latitude": 1, "longitude": 2}]}
++            return {"current": {"us_aqi": 150, "pm2_5": 5.0, "pm10": 20.0, "ozone": 200}}
++        self.assertEqual(fetch_live("X", f).dominant, "Ozone / gases")
++
++
++class CacheTests(unittest.TestCase):
++    def setUp(self):
++        clear_caches()
++        self.calls = []
++        self.fetcher = open_meteo(self.calls)
++
++    def tearDown(self):
++        clear_caches()
++
++    def n_air(self):
++        return len([c for c in self.calls if "air-quality" in c])
++
++    def test_ttl_and_key_normalisation(self):
++        fetch_live("Delhi", self.fetcher)
++        self.assertTrue(fetch_live("  delhi ", self.fetcher).cached)
++        self.assertEqual(self.n_air(), 1)
++        with mock.patch("time.monotonic", return_value=time.monotonic() + 601):
++            self.assertFalse(fetch_live("Delhi", self.fetcher).cached)
++        self.assertEqual(self.n_air(), 2)
++        self.assertEqual(len([c for c in self.calls if "geocoding" in c]), 1)  # coords cached
++
++    def test_serves_stale_on_upstream_error(self):
++        fetch_live("Delhi", self.fetcher)
++        down = open_meteo(fail_air=True)
++        with mock.patch("time.monotonic", return_value=time.monotonic() + 1200):
++            r = fetch_live("Delhi", down)
++            self.assertEqual((r.aqi, r.cached), (168, True))
++        self.assertEqual(cache_stats()["stale_served"], 1)
++        with mock.patch("time.monotonic", return_value=time.monotonic() + 5 * 3600):
++            with self.assertRaises(DataSourceError):  # too old to serve
++                fetch_live("Delhi", down)
++
++    def test_not_found_not_masked(self):
++        with self.assertRaises(LocationNotFound):
++            fetch_live("zzz", self.fetcher)
++
++    def test_coords_label_and_cache(self):
++        r = fetch_live_coords(28.6, 77.2, fetcher=self.fetcher)
++        self.assertEqual(r.place, "Your location")
++        self.assertTrue(fetch_live_coords(28.601, 77.204, fetcher=self.fetcher).cached)  # ~1 km bucket
++        self.assertEqual(self.n_air(), 1)
++
++
++class InsightTests(unittest.TestCase):
++    def rows(self, start="2026-11-19T14:00", hours=24, **kw):
++        s = hourly_series(start, hours, **kw)
++        return tuple(zip(s["time"], s["us_aqi"]))
++
++    def test_best_window_in_waking_hours(self):
++        w = best_window(self.rows())
++        self.assertEqual((fmt_window(w), w.avg_aqi), ("4 PM–6 PM", 70))
++
++    def test_never_suggests_night(self):
++        rows = self.rows(shape=lambda h: 20 if h < 5 or h >= 23 else 150)
++        w = best_window(rows)
++        self.assertGreaterEqual(w.avg_aqi, 150)  # the 20-AQI night hours are never offered
++        self.assertTrue(5 <= int(w.start[11:13]) < 22)
++
++    def test_trend(self):
++        self.assertEqual(trend(self.rows()), "improving")
++        self.assertEqual(trend(self.rows(shape=lambda h: 100)), "steady")
++        self.assertEqual(trend((("2026-11-19T14:00", 50), ("2026-11-19T15:00", 90), ("2026-11-19T16:00", 95))), "worsening")
++        self.assertIsNone(trend(()))
++
++    def test_fmt_hour(self):
++        self.assertEqual([fmt_hour(f"2026-11-19T{h:02d}:00") for h in (0, 9, 12, 18)],
++                         ["12 AM", "9 AM", "12 PM", "6 PM"])
++
++
++class AssistantLiveTests(unittest.TestCase):
++    def setUp(self):
++        clear_caches()
++
++    def test_live_advice_includes_forecast_and_freshness(self):
++        fetch = lambda c: fetch_live(c, open_meteo())
++        s = respond("air quality in Delhi", None, live_fetch=fetch, use_llm=False).state
++        s = respond("none", s, live_fetch=fetch, use_llm=False).state
++        r = respond("going for a walk", s, live_fetch=fetch, use_llm=False)
++        self.assertIn("live data, updated 2 PM local time", r.text)
++        self.assertIn("Best time to go out today: 4 PM–6 PM", r.text)
++        self.assertIn("improving", r.text)
++        self.assertIsNotNone(r.live)
++
++    def test_stricter_advice_is_explained(self):
++        fetch = lambda c: fetch_live(c, open_meteo())
++        r = respond("AQI is 130 in Pune, I have asthma and want to run", None, live_fetch=fetch, use_llm=False)
++        self.assertIn("stricter because of a lung condition", r.text)
++        self.assertEqual(r.state.location, "Pune")  # location kept even when a number is given
++
++    def test_refreshes_each_turn_while_live(self):
++        calls = []
++        fetch = lambda c: (calls.append(c), fetch_live(c, open_meteo()))[1]
++        s = respond("air in Delhi", None, live_fetch=fetch, use_llm=False).state
++        respond("none", s, live_fetch=fetch, use_llm=False)
++        self.assertEqual(len(calls), 2)
++
++    def test_user_numbers_stop_live_refresh(self):
++        calls = []
++        fetch = lambda c: (calls.append(c), fetch_live(c, open_meteo()))[1]
++        s = respond("air in Delhi", None, live_fetch=fetch, use_llm=False).state
++        s = respond("actually AQI is 40", s, live_fetch=fetch, use_llm=False).state
++        respond("walk", s, live_fetch=fetch, use_llm=False)
++        self.assertEqual(len(calls), 1)
++        self.assertEqual(s.source, "user")
++
++    def test_transient_failure_keeps_last_reading(self):
++        ok = lambda c: fetch_live(c, open_meteo())
++        s = respond("air in Delhi", None, live_fetch=ok, use_llm=False).state
++
++        def boom(c):
++            raise DataSourceError("down")
++        r = respond("none", s, live_fetch=boom, use_llm=False)
++        self.assertFalse(r.state.fetch_failed)
++        self.assertEqual(r.state.aqi, 168)
++
++    def test_share_location_flow(self):
++        coords_fetch = lambda la, lo: fetch_live_coords(la, lo, fetcher=open_meteo())
++        r = respond("what is the air at my location?", None, coords=(28.6, 77.2),
++                    coords_fetch=coords_fetch, live_fetch=None, use_llm=False)
++        self.assertEqual((r.state.location, r.state.lat, r.state.lon), ("Your location", 28.6, 77.2))
++        self.assertEqual(r.state.aqi, 168)
++        # typing a city afterwards drops the stored coordinates
++        r2 = respond("what about in Pune", r.state, coords_fetch=coords_fetch,
++                     live_fetch=lambda c: fetch_live(c, open_meteo()), use_llm=False)
++        self.assertEqual((r2.state.location, r2.state.lat), ("Pune", None))
++
++    def test_state_validates_coordinates(self):
++        ctx = UserContext.from_dict({"lat": 999, "lon": 5})
++        self.assertEqual((ctx.lat, ctx.lon), (None, None))
++        ctx = UserContext.from_dict({"lat": 12.5, "lon": 77.5})
++        self.assertEqual(ctx.to_dict()["lat"], 12.5)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/airguide-assistant/tests/test_live_api.py b/airguide-assistant/tests/test_live_api.py
+new file mode 100644
+index 0000000..93cdf0e
+--- /dev/null
++++ b/airguide-assistant/tests/test_live_api.py
+@@ -0,0 +1,91 @@
++import json
++import threading
++import unittest
++import urllib.error
++import urllib.request
++from http.server import ThreadingHTTPServer
++
++from airguide.data_source import clear_caches, fetch_live, fetch_live_coords
++from airguide.server import RateLimiter, build_handler
++from tests.fakes import open_meteo
++
++
++class LiveApiTests(unittest.TestCase):
++    httpd = None
++    ok = False
++
++    @classmethod
++    def setUpClass(cls):
++        clear_caches()
++        f = open_meteo()
++        handler = build_handler(
++            live_fetch=lambda c: fetch_live(c, f),
++            coords_fetch=lambda la, lo: fetch_live_coords(la, lo, fetcher=f),
++            use_llm=False,
++            limiter=RateLimiter(100, 60),
++        )
++        try:
++            cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
++            cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
++            threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
++            urllib.request.urlopen(cls.base + "/healthz", timeout=2).read()
++            cls.ok = True
++        except OSError:
++            cls.httpd = None
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.httpd:
++            cls.httpd.shutdown(); cls.httpd.server_close()
++
++    def setUp(self):
++        if not self.ok:
++            self.skipTest("loopback sockets unavailable")
++
++    def get(self, path):
++        try:
++            with urllib.request.urlopen(self.base + path) as r:
++                return r.status, json.loads(r.read()), r.headers
++        except urllib.error.HTTPError as e:
++            return e.code, json.loads(e.read()), e.headers
++
++    def post(self, body):
++        req = urllib.request.Request(self.base + "/api/chat", data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"}, method="POST")
++        with urllib.request.urlopen(req) as r:
++            return json.loads(r.read())
++
++    def test_live_by_city(self):
++        status, body, headers = self.get("/api/live?city=Delhi")
++        self.assertEqual(status, 200)
++        live = body["live"]
++        self.assertEqual((live["place"], live["aqi"], len(live["forecast"])), ("Delhi, India", 168, 24))
++        self.assertIn("no-store", headers["Cache-Control"])
++
++    def test_live_by_coords_and_validation(self):
++        self.assertEqual(self.get("/api/live?lat=28.6&lon=77.2")[0], 200)
++        for bad in ("/api/live", "/api/live?lat=95&lon=0", "/api/live?lat=x&lon=1", "/api/live?city=%3C%3E%21%21"):
++            self.assertEqual(self.get(bad)[0], 400, bad)
++
++    def test_live_unknown_city_404(self):
++        self.assertEqual(self.get("/api/live?city=zzz")[0], 404)
++
++    def test_geolocation_header(self):
++        self.assertIn("geolocation=(self)", self.get("/healthz")[2]["Permissions-Policy"])
++
++    def test_chat_returns_live_payload_and_coords_flow(self):
++        body = self.post({"message": "air quality in Delhi", "state": None})
++        self.assertEqual(body["live"]["aqi"], 168)
++        body = self.post({"message": "at my location", "state": None, "coords": {"lat": 28.6, "lon": 77.2}})
++        self.assertEqual(body["state"]["location"], "Your location")
++        self.assertEqual(body["live"]["place"], "Your location")
++        # junk coords are ignored, not crashed on
++        body = self.post({"message": "hello", "state": None, "coords": {"lat": "x", "lon": 999}})
++        self.assertIsNone(body["live"])
++
++    def test_chat_without_live_has_null(self):
++        self.assertIsNone(self.post({"message": "AQI is 40", "state": None})["live"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/airguide-assistant/web/app.js b/airguide-assistant/web/app.js
+index 90ce53e..55ededd 100644
+--- a/airguide-assistant/web/app.js
++++ b/airguide-assistant/web/app.js
+@@ -11,7 +11,15 @@
+   var ttsStatus = document.getElementById("tts-status");
+   var resetBtn = document.getElementById("reset-btn");
+   var loadingStatus = document.getElementById("loading-status");
+-  var chips = document.querySelectorAll(".chip");
++  var chips = document.querySelectorAll(".chip[data-prompt]");
++  var geoBtn = document.getElementById("geo-btn");
++  var livePanel = document.getElementById("live-panel");
++  var liveRefreshBtn = document.getElementById("live-refresh");
++  var LIVE_REFRESH_MS = 10 * 60 * 1000;
++  var liveTimer = null;
++  var liveCoords = null;
++  var liveLabel = "";
++  var lastLevel = null;
+ 
+   var state = null;
+   var ttsEnabled = false;
+@@ -112,7 +120,142 @@
+       .catch(function () {});
+   }
+ 
+-  function sendMessage(message) {
++  // ---- Live conditions panel (real-time data) ----
++  var CATEGORY = ["Good", "Moderate", "Unhealthy for Sensitive Groups", "Unhealthy", "Very Unhealthy", "Hazardous"];
++  var SVG_NS = "http://www.w3.org/2000/svg";
++
++  function levelIndex(aqi) {
++    return aqi <= 50 ? 0 : aqi <= 100 ? 1 : aqi <= 150 ? 2 : aqi <= 200 ? 3 : aqi <= 300 ? 4 : 5;
++  }
++
++  function hourLabel(iso) {
++    var h = parseInt(String(iso).slice(11, 13), 10);
++    if (isNaN(h)) return "";
++    return (h % 12 || 12) + (h < 12 ? " AM" : " PM");
++  }
++
++  function svgEl(name, attrs) {
++    var el = document.createElementNS(SVG_NS, name);
++    Object.keys(attrs || {}).forEach(function (k) { el.setAttribute(k, attrs[k]); });
++    return el;
++  }
++
++  function drawForecast(rows) {
++    var chart = document.getElementById("live-chart");
++    while (chart.firstChild) chart.removeChild(chart.firstChild);
++    if (!rows || !rows.length) return;
++    var max = Math.max(150, Math.max.apply(null, rows.map(function (r) { return r.aqi; })));
++    rows.forEach(function (r, i) {
++      var h = Math.max(3, Math.round((r.aqi / max) * 84));
++      var rect = svgEl("rect", {
++        x: i * 20, y: 92 - h, width: 16, height: h, rx: 2,
++        "class": "f" + levelIndex(r.aqi) + (i === 0 ? " now" : "")
++      });
++      var title = svgEl("title");
++      title.textContent = hourLabel(r.time) + ": AQI " + r.aqi + " (" + CATEGORY[levelIndex(r.aqi)] + ")";
++      rect.appendChild(title);
++      chart.appendChild(rect);
++      if (i % 6 === 0) {
++        var label = svgEl("text", { x: i === 0 ? 0 : i * 20 + 8, y: 108, "class": i === 0 ? "axis first" : "axis" });
++        label.textContent = i === 0 ? "Now" : hourLabel(r.time);
++        chart.appendChild(label);
++      }
++    });
++  }
++
++  function addPollutant(list, name, value, unit) {
++    if (value === null || value === undefined) return;
++    var box = document.createElement("div");
++    var dt = document.createElement("dt");
++    dt.textContent = name;
++    var dd = document.createElement("dd");
++    dd.appendChild(document.createTextNode(Math.round(value * 10) / 10 + " "));
++    var small = document.createElement("small");
++    small.textContent = unit;
++    dd.appendChild(small);
++    box.appendChild(dt);
++    box.appendChild(dd);
++    list.appendChild(box);
++  }
++
++  function renderLive(live, label) {
++    if (!live || live.aqi === null || live.aqi === undefined) { hideLive(); return; }
++    liveCoords = (live.lat !== null && live.lon !== null) ? { lat: live.lat, lon: live.lon } : null;
++    liveLabel = label || live.place || liveLabel;
++    document.getElementById("live-place").textContent = liveLabel;
++    var idx = levelIndex(live.aqi);
++    var badge = document.getElementById("live-aqi");
++    badge.textContent = "AQI " + live.aqi + " \u00B7 " + CATEGORY[idx];
++    badge.className = "badge b" + idx;
++    document.getElementById("live-dominant").textContent =
++      live.dominant ? "Main pollutant: " + live.dominant : "";
++    var list = document.getElementById("live-pollutants");
++    list.innerHTML = "";
++    addPollutant(list, "PM2.5", live.pm25, "\u00B5g/m\u00B3");
++    addPollutant(list, "PM10", live.pm10, "\u00B5g/m\u00B3");
++    addPollutant(list, "O\u2083", live.ozone, "\u00B5g/m\u00B3");
++    addPollutant(list, "NO\u2082", live.no2, "\u00B5g/m\u00B3");
++    addPollutant(list, "SO\u2082", live.so2, "\u00B5g/m\u00B3");
++    addPollutant(list, "CO", live.co, "\u00B5g/m\u00B3");
++    drawForecast(live.forecast);
++    var when = live.observed_at ? "Updated " + hourLabel(live.observed_at) + " local time \u00B7 " : "";
++    var note = (lastLevel !== null && lastLevel !== idx) ? " \u00B7 Air quality category changed" : "";
++    document.getElementById("live-updated").textContent =
++      when + live.provider + " \u00B7 auto-refreshes every 10 min" + note;
++    lastLevel = idx;
++    livePanel.hidden = false;
++    if (!liveTimer) liveTimer = setInterval(refreshLive, LIVE_REFRESH_MS);
++  }
++
++  function hideLive() {
++    livePanel.hidden = true;
++    lastLevel = null;
++    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
++  }
++
++  function refreshLive() {
++    if (!liveCoords) return;
++    liveRefreshBtn.disabled = true;
++    fetch("/api/live?lat=" + liveCoords.lat + "&lon=" + liveCoords.lon)
++      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
++      .then(function (res) {
++        liveRefreshBtn.disabled = false;
++        if (res.ok) renderLive(res.body.live, liveLabel);
++        else document.getElementById("live-updated").textContent = res.body.error || "Refresh failed";
++      })
++      .catch(function () {
++        liveRefreshBtn.disabled = false;
++        document.getElementById("live-updated").textContent = "Offline: showing the last reading";
++      });
++  }
++
++  if (liveRefreshBtn) liveRefreshBtn.addEventListener("click", refreshLive);
++
++  function shareLocation() {
++    if (!navigator.geolocation) {
++      addMessage("AirGuide", "Your browser doesn't support location sharing. Please type your city instead.", "bot");
++      return;
++    }
++    geoBtn.disabled = true;
++    navigator.geolocation.getCurrentPosition(
++      function (pos) {
++        geoBtn.disabled = false;
++        sendMessage("What is the air quality at my location?", {
++          lat: Math.round(pos.coords.latitude * 10000) / 10000,
++          lon: Math.round(pos.coords.longitude * 10000) / 10000
++        });
++      },
++      function () {
++        geoBtn.disabled = false;
++        addMessage("AirGuide", "I couldn't get your location (permission denied or unavailable). Please type your city instead.", "bot");
++      },
++      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
++    );
++  }
++
++  if (geoBtn) geoBtn.addEventListener("click", shareLocation);
++
++  function sendMessage(message, coords) {
+     if (!message) return;
+     addMessage("You", message, "user");
+     input.value = "";
+@@ -123,7 +266,7 @@
+     fetch("/api/chat", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({ message: message, state: state })
++      body: JSON.stringify({ message: message, state: state, coords: coords || undefined })
+     })
+       .then(function (r) {
+         return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+@@ -141,6 +284,8 @@
+         addMessage("AirGuide", res.body.reply, "bot");
+         updateStatus(res.body.summary);
+         announce("New guidance received from AirGuide.");
++        if (res.body.live) renderLive(res.body.live, res.body.summary && res.body.summary.location);
++        else if (!state || state.source !== "live") hideLive();
+         if (res.body.provider && engineBadge) {
+           engineBadge.textContent = res.body.provider;
+         }
+@@ -158,7 +303,7 @@
+ 
+   form.addEventListener("submit", function (e) {
+     e.preventDefault();
+-    sendMessage(input.value.trim());
++    sendMessage(input.value.trim(), null);
+   });
+ 
+   chips.forEach(function (chip) {
+@@ -166,7 +311,7 @@
+       var prompt = chip.getAttribute("data-prompt");
+       if (prompt) {
+         input.value = prompt;
+-        sendMessage(prompt);
++        sendMessage(prompt, null);
+       }
+     });
+   });
+@@ -186,6 +331,7 @@
+   if (resetBtn) {
+     resetBtn.addEventListener("click", function () {
+       state = null;
++      hideLive();
+       status.textContent = "No reading yet";
+       status.className = "badge badge-none";
+       log.innerHTML = "";
+diff --git a/airguide-assistant/web/index.html b/airguide-assistant/web/index.html
+index 198a0d1..536e3d3 100644
+--- a/airguide-assistant/web/index.html
++++ b/airguide-assistant/web/index.html
+@@ -6,6 +6,7 @@
+   <title>AirGuide – Urban Air Quality Assistant (Challenge 6)</title>
+   <meta name="description" content="Personalised urban air quality guidance using real-time EPA AQI calculations, context routing, and safe Gen-AI phrasing.">
+   <link rel="stylesheet" href="/static/style.css">
++  <link rel="icon" href="data:,">
+ </head>
+ <body>
+   <!-- Accessibility Skip Navigation Link -->
+@@ -44,11 +45,33 @@
+       </div>
+     </section>
+ 
++    <!-- Live conditions (real-time data) -->
++    <section id="live-panel" class="live-panel" aria-labelledby="live-h" hidden>
++      <div class="live-head">
++        <h2 id="live-h">Live conditions: <span id="live-place"></span></h2>
++        <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>LIVE</span>
++      </div>
++      <div class="live-main">
++        <p id="live-aqi" class="badge"></p>
++        <p id="live-dominant" class="live-meta"></p>
++      </div>
++      <dl id="live-pollutants" class="pollutants"></dl>
++      <figure class="forecast">
++        <figcaption>Forecast: next 24 hours (US AQI)</figcaption>
++        <svg id="live-chart" viewBox="0 0 480 116" role="img" aria-label="Hourly AQI forecast for the next 24 hours"></svg>
++      </figure>
++      <div class="live-foot">
++        <span id="live-updated" class="live-meta" aria-live="polite"></span>
++        <button id="live-refresh" type="button" class="btn-control">&#8635; Refresh now</button>
++      </div>
++    </section>
++
+     <!-- Quick Action Scenario Chips -->
+     <section aria-labelledby="chips-h" class="quick-scenarios">
+       <h2 id="chips-h" class="sr-only">Quick Test Scenarios</h2>
+       <span class="chips-label" id="chips-lbl">Try quick scenarios:</span>
+       <div class="chips-group" role="group" aria-labelledby="chips-lbl">
++        <button type="button" class="chip chip-geo" id="geo-btn" aria-label="Use my current location to check live air quality">&#128225; Use my location</button>
+         <button type="button" class="chip" data-prompt="What is the air quality like in Delhi?" aria-label="Scenario: Check live air quality in Delhi">📍 Delhi Air (Live)</button>
+         <button type="button" class="chip" data-prompt="AQI is 165 in Mumbai, I have asthma and want to go for a run" aria-label="Scenario: Running with asthma in AQI 165">🏃 Run with Asthma</button>
+         <button type="button" class="chip" data-prompt="AQI is 220, taking my 5-year-old child to school" aria-label="Scenario: Child commute in hazardous AQI 220">👶 Child Commute (AQI 220)</button>
+diff --git a/airguide-assistant/web/style.css b/airguide-assistant/web/style.css
+index 5a2e45a..bfda3e5 100644
+--- a/airguide-assistant/web/style.css
++++ b/airguide-assistant/web/style.css
+@@ -399,3 +399,39 @@ button[type="submit"]:disabled {
+     animation: none !important;
+   }
+ }
++
++/* ---- Live conditions panel ---- */
++.live-panel { margin: 1rem 0; padding: 0.9rem 1rem; background: var(--card-bg);
++  border: 1px solid var(--border); border-radius: var(--border-radius); }
++.live-panel[hidden] { display: none; }
++.live-head { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
++.live-head h2 { margin: 0; font-size: 1rem; font-weight: 700; }
++.live-pill { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.7rem;
++  font-weight: 800; letter-spacing: 0.08em; color: #15803d; border: 1px solid #15803d;
++  border-radius: 999px; padding: 0.15rem 0.6rem; }
++.live-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #15803d;
++  animation: livepulse 1.6s ease-in-out infinite; }
++@keyframes livepulse { 50% { opacity: 0.25; } }
++@media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
++.live-main { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin: 0.6rem 0; }
++.live-meta { margin: 0; font-size: 0.8125rem; color: var(--muted); }
++.pollutants { display: grid; grid-template-columns: repeat(auto-fit, minmax(5.5rem, 1fr));
++  gap: 0.5rem; margin: 0 0 0.75rem; }
++.pollutants div { background: var(--bg); border: 1px solid var(--border);
++  border-radius: 0.5rem; padding: 0.4rem 0.6rem; }
++.pollutants dt { font-size: 0.7rem; font-weight: 700; color: var(--muted); text-transform: uppercase; }
++.pollutants dd { margin: 0; font-weight: 700; font-size: 1rem; }
++.pollutants dd small { font-weight: 500; color: var(--muted); font-size: 0.7rem; }
++.forecast { margin: 0 0 0.5rem; }
++.forecast figcaption { font-size: 0.75rem; font-weight: 700; color: var(--muted);
++  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.25rem; }
++#live-chart { width: 100%; height: auto; display: block; }
++#live-chart .f0 { fill: #15803d; } #live-chart .f1 { fill: #facc15; }
++#live-chart .f2 { fill: #f97316; } #live-chart .f3 { fill: #dc2626; }
++#live-chart .f4 { fill: #7e22ce; } #live-chart .f5 { fill: #881337; }
++#live-chart .now { stroke: var(--fg); stroke-width: 2; }
++#live-chart .axis { fill: var(--muted); font-size: 10px; text-anchor: middle; }
++.live-foot { display: flex; justify-content: space-between; align-items: center;
++  flex-wrap: wrap; gap: 0.5rem; }
++.chip-geo { border-color: var(--accent); }
++#live-chart .axis.first { text-anchor: start; }
+-- 
+2.43.0
+
+
+From 83fcdff822f511dae9466cb1ad5cfe345b3a2171 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 04:51:55 +0000
+Subject: [PATCH 2/2] Add saved health profile, AQI threshold alerts, CI and
+ repo hygiene
+
+- web: opt-in "Remember my health profile" (sensitive groups only, never location),
+  restored on load and after Reset so the sensitivity question is skipped
+- web: AQI threshold alerts (in-page message + browser notification, once per
+  excursion, applied immediately when toggled, persisted across reloads)
+- repo: add .gitignore and .dockerignore, stop tracking committed __pycache__ files,
+  add GitHub Actions workflow running the unit tests
+- tests: saved-profile round trip and unknown-group filtering (71 passing)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013dt8LiRVaebM9pr7VP4C7T
+---
+ .github/workflows/test.yml                    |  19 +++
+ airguide-assistant/.dockerignore              |   9 ++
+ airguide-assistant/.gitignore                 |   9 ++
+ .../__pycache__/cli.cpython-312.pyc           | Bin 1530 -> 0 bytes
+ .../__pycache__/__init__.cpython-312.pyc      | Bin 202 -> 0 bytes
+ .../airguide/__pycache__/aqi.cpython-312.pyc  | Bin 4469 -> 0 bytes
+ .../__pycache__/assistant.cpython-312.pyc     | Bin 10706 -> 0 bytes
+ .../__pycache__/context.cpython-312.pyc       | Bin 6581 -> 0 bytes
+ .../__pycache__/data_source.cpython-312.pyc   | Bin 7848 -> 0 bytes
+ .../airguide/__pycache__/llm.cpython-312.pyc  | Bin 6669 -> 0 bytes
+ .../__pycache__/prompt.cpython-312.pyc        | Bin 2449 -> 0 bytes
+ .../__pycache__/router.cpython-312.pyc        | Bin 5815 -> 0 bytes
+ .../__pycache__/server.cpython-312.pyc        | Bin 12666 -> 0 bytes
+ .../__pycache__/__init__.cpython-312.pyc      | Bin 114 -> 0 bytes
+ .../__pycache__/test_aqi.cpython-312.pyc      | Bin 3263 -> 0 bytes
+ .../test_assistant.cpython-312.pyc            | Bin 12477 -> 0 bytes
+ .../__pycache__/test_cache.cpython-312.pyc    | Bin 3324 -> 0 bytes
+ .../__pycache__/test_cli.cpython-312.pyc      | Bin 3444 -> 0 bytes
+ .../__pycache__/test_router.cpython-312.pyc   | Bin 5226 -> 0 bytes
+ .../__pycache__/test_server.cpython-312.pyc   | Bin 7887 -> 0 bytes
+ .../test_server_efficiency.cpython-312.pyc    | Bin 2185 -> 0 bytes
+ airguide-assistant/tests/test_live_api.py     |   7 ++
+ airguide-assistant/web/app.js                 | 117 +++++++++++++++++-
+ airguide-assistant/web/index.html             |  19 +++
+ airguide-assistant/web/style.css              |  11 ++
+ 25 files changed, 189 insertions(+), 2 deletions(-)
+ create mode 100644 .github/workflows/test.yml
+ create mode 100644 airguide-assistant/.dockerignore
+ create mode 100644 airguide-assistant/.gitignore
+ delete mode 100644 airguide-assistant/__pycache__/cli.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/__init__.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/aqi.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/assistant.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/context.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/data_source.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/llm.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/prompt.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/router.cpython-312.pyc
+ delete mode 100644 airguide-assistant/airguide/__pycache__/server.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/__init__.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_aqi.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_assistant.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_cache.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_cli.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_router.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_server.cpython-312.pyc
+ delete mode 100644 airguide-assistant/tests/__pycache__/test_server_efficiency.cpython-312.pyc
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+new file mode 100644
+index 0000000..2d9b9b0
+--- /dev/null
++++ b/.github/workflows/test.yml
+@@ -0,0 +1,19 @@
++name: tests
++
++on:
++  push:
++  pull_request:
++
++jobs:
++  unittest:
++    runs-on: ubuntu-latest
++    defaults:
++      run:
++        working-directory: airguide-assistant
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++      - name: Run unit tests
++        run: python -m unittest discover -s tests -t . -v
+diff --git a/airguide-assistant/.dockerignore b/airguide-assistant/.dockerignore
+new file mode 100644
+index 0000000..6674006
+--- /dev/null
++++ b/airguide-assistant/.dockerignore
+@@ -0,0 +1,9 @@
++.git
++.github
++__pycache__
++*.pyc
++tests
++*.md
++.env
++.venv
++*.zip
+diff --git a/airguide-assistant/.gitignore b/airguide-assistant/.gitignore
+new file mode 100644
+index 0000000..30d05e2
+--- /dev/null
++++ b/airguide-assistant/.gitignore
+@@ -0,0 +1,9 @@
++__pycache__/
++*.py[cod]
++.env
++.venv/
++venv/
++*.egg-info/
++.pytest_cache/
++.DS_Store
++*.zip
+diff --git a/airguide-assistant/__pycache__/cli.cpython-312.pyc b/airguide-assistant/__pycache__/cli.cpython-312.pyc
+deleted file mode 100644
+index 54391f3119bf183481084f13c900101f654460af..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 1530
+zcmaJ>&2Jk;6o0cH{#b9~#EDaqLKy_YF-gqV1)?;Nq@jr@g+fxPmW8$PPLfU5yJlvb
+zWGzPu5)!FW2@r<{RR|<5l>7;t=#@)KjYwDS2`=0W;edJpjh(fFRPj5EX5O3k=6(I<
+z$F4370O0ly|Ezs41N<ru0hE)?u>$}%!GtWB$dqi9MJ6(3TPn&~83~zUD@8S{A~01F
+zT9(YvM@lwKB4&7f7=S(|0YPhtz-<Q-knq9D@c^|p2t3J?(viwL3xpOe$FQ;Ga6*j&
+zw>Ai#xipUps|Lr*F2z$8y;!zPf(^zj#tnyOG;NU?D`Z^57~_)1S6v4eY%5dpwBN-8
+zm($1(Q^HEFW2TWGTV#aJxDF><+z(O0%hV}!0t8S2Kn8&0_mQXpKZz2+M4gCFNu^U#
+zVb?^E<2FPg3S9VX!jyyCYvDlFLE8#d(OOqW9w5-0p$(w=sTjh6R|K9~MGW1T;PJq!
+zimGrRwNBeoRa)x_G#zZ8&L~oq9@V>BU`D@e$B*Df@oC_Zzz1(mmB6y}4A5?L+N08m
+z?;3dOCTz*qU=yXa%Jc7*o&U6(2Q$D3W0vdSO^dI#`<|&xv`1hJFVZE$5juROY}gj}
+z@Ki7sc$j-7f>R%qEuO;M#bnFk>B`6gv29!=*mKJi7lesRF?UVFOEElkWnNreA}f}Y
+z(JIm;t~{a5Zdu%NRyrZz_qgF<W-ODZs3_~CSbRl1;49+2%H#iMQ;BIo3gg&ET3Ykf
+z615yo1^ax}a!O_HtBg~t<VR-Teq)wWm-@YL5^u>hs5vjVLCYoXtG2sIC>28|?i-x=
+ziWuv(Oht?RaFH-U4PT|CWP40p#27!kIy0UVEMPgqa0;u2o$(CQ*vMTVY@NHM+-0(f
+zmtET=G-p_JMeuE`&9_I1T6FW3qG35S2>?0(u<rn12YyqchuU0CnXik@D>dcSx_)Nw
+zt)1B;t-B#9(PVw#?EZz%*MAvE-5p5X8%Xb7Y(zls`{exf^Lwuyp3B^gW$JqGVd90F
+z{^C(z|NZ#Dk=|eLIkO-BI(e@rwW}WWByYw(i|wlQNY|(O{^D2JFS7fWzLgHUM{1GL
+z##xBP|Nbiky@R!(k;C}tpCCn(O^+|t^q24V^*2;0ntaH50pOd#={Vep4^5BCcSg|k
+zsO(4bd688<pVs_vK5x2(eBPIt$NWT4n@qbltyc836@}I}(`u|NS}ckqd^$#v<nvVg
+z0k`2;u!i<GRTD+mEZby~J_!Kg>tU}0Kto0d{h=sGIo1Hh9>B8?V7L)Vpt0S;F(lAf
+l<2g|D-O5k$;E|&5%zQle;oS9wy{kVf{S6tEA$kq~{solxfWiO(
+
+diff --git a/airguide-assistant/airguide/__pycache__/__init__.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/__init__.cpython-312.pyc
+deleted file mode 100644
+index 40ba235be6046f88003c7dddb6867c67c428bfa9..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 202
+zcmX@j%ge>Uz`(E}=U<jP0|Ucj5C;Yrp^VQw3=9m@8B!Rc7*ZIc7%Q1HnX5D%GmG3y
+zGgDHn6cY0kLW`0T^AsF2ixdJ&6LT_4Dis`yi!+N$67x#*s#p#64D<~AG?{L($H%AS
+zC&$O%;*O6mOD!tS%+HIDU&-(pWX~^=#LS{}kclzz@tJv<CGqik1(mlrY;yBcN^?@}
+iir5(#z%DB0Wnf_Vz|6?Vc#}c@0iS3icM&TC0|Nj79yRL#
+
+diff --git a/airguide-assistant/airguide/__pycache__/aqi.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/aqi.cpython-312.pyc
+deleted file mode 100644
+index 816e6cba15f13b70c46fa24e40f255ef1d22fce6..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 4469
+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
+XYI-y*#iWj%=9qNkQL`*{h@<`+?KpG9
+
+diff --git a/airguide-assistant/airguide/__pycache__/assistant.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/assistant.cpython-312.pyc
+deleted file mode 100644
+index 1cb4947bd307333286f8e81275f964ab81089d07..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 10706
+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
+
+diff --git a/airguide-assistant/airguide/__pycache__/context.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/context.cpython-312.pyc
+deleted file mode 100644
+index fe2055c8570b6c4ace2177510964b1ab7eaa8eea..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 6581
+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
+B^i===
+
+diff --git a/airguide-assistant/airguide/__pycache__/data_source.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/data_source.cpython-312.pyc
+deleted file mode 100644
+index 3592d2b06b2bee7f42cb70e618def05c849e2e05..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 7848
+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
+P>jLt2J_tfD)xQ4&qxf=%
+
+diff --git a/airguide-assistant/airguide/__pycache__/llm.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/llm.cpython-312.pyc
+deleted file mode 100644
+index d5f276373c7c9b91235917548a6b10609652c580..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 6669
+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
+AiU0rr
+
+diff --git a/airguide-assistant/airguide/__pycache__/prompt.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/prompt.cpython-312.pyc
+deleted file mode 100644
+index 406859dd9f618b8a848aff2667550686f77dd197..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 2449
+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
+
+diff --git a/airguide-assistant/airguide/__pycache__/router.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/router.cpython-312.pyc
+deleted file mode 100644
+index 6cfdd452a4bd86be4bd9126e61a48a1433db2c01..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 5815
+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
+LIjIyC`NIDNfb~p>
+
+diff --git a/airguide-assistant/airguide/__pycache__/server.cpython-312.pyc b/airguide-assistant/airguide/__pycache__/server.cpython-312.pyc
+deleted file mode 100644
+index e6cfba4d213c9b58b9eb1aef9d938df981cd2aee..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 12666
+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
+Pe-vmN9i%@Rg!2CZ8Lg^-
+
+diff --git a/airguide-assistant/tests/__pycache__/__init__.cpython-312.pyc b/airguide-assistant/tests/__pycache__/__init__.cpython-312.pyc
+deleted file mode 100644
+index f2faee6b6e1ba8e601479f1bb434581825e5c6e1..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 114
+zcmX@j%ge>Uz`$@O=U*0xehebe!Dki*28QVjl?<AUek&P@m>3usK7-W!5-dqAE-8+Q
+vkI&4@EQycTE2zB1VUwGmQks)$SH#M|z`)4Bz)%cgd}L;1WGrH4U|;|M_$?P9
+
+diff --git a/airguide-assistant/tests/__pycache__/test_aqi.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_aqi.cpython-312.pyc
+deleted file mode 100644
+index a68eaf60e1240560e589aa7fa4f2db087e2df257..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 3263
+zcmcguO-xi*6h8O;3>TOYF=`n_q|#U)q{xpnO08i;s>U#=wT-?sd3o?|ad3X%zBdRH
+z7d9DF7hQCvO>n_dgNy!bX3;cFyD@2+l=2AXwTmWQm`OJVOq$rFH0RB{c{6}my69Ql
+zxxZ)L`R;eVbAJehY5)L!ivK<KqYUsn4m^{Kot2vaa2E_PNE}rB72+fzs6s+i#e}3v
+z30ajB0X0BCfYV@zSui99W7|AOzRih+zDilOAzwQLz;_71U~H$q$FsR&hrl$MCQ2ZW
+z<ESD#bVRq<Xo^oewQ)Ad;#w?euqmfDHOaUhk8Aow%&9ih!^QdS=Lfrbw38PHBInKz
+zosC|4cf|V#G*TR_bhtq>P>BJmV2~`Rq9J5Kl`tSxHl!@50YlD$T4e;Xpwj6og*r4c
+z5xc}p%N+4Mp;Z9@hPo0Y2;B`BD_<>|RRjaTAeQ9K8iEIsLFR<QEP1&HaYGN%7Cgus
+zdI)U6L)C^JsPADKl<FwQpz?^vlR|U{`tn@>FxrjwRirO(_@i@u`8xpcKy+$#(`4Kl
+zm`Lk!9smH2AU`0EWU}~&Ci-iBUT@)5e1I*|pnZJW+360(6J0&pa4MZNbRJ`7W}kO$
+z?HetlXLAeyZo*?4T%ry0wBcTOw$ncNW{xa`dvg(+o+w}GwhtZ6y}A%So*TAlq<rOw
+ztsKjBE`;CCnKtcz!O9}-UqLK3=FmGXGyfxp#0vDK=;;1ie_Y6Y6Y1l%h#}@E-;T`=
+zjM+tzV=_8TJ}?$fCo$(tEt#@3jwqU$*Ec|Lqm3c-+vsBXTN#!;c581gvJgJ;t++@}
+z@!kJV^s%f6;6|Q*MmCR}O<9~Jm^P`$)6CRH^l?qMw4RQRwUNJYW4#}F`MvvG8Cj$!
+z*GG=rcC{n3*}WH)0bs7EEImNL@+2D-1^u|@D+)pJ1_R1D(E^=dlIsG2D?m_eVM@FL
+z*NGxV^Q)_?t1eoK<OB=(cTta-%yeqrM_2|pPjNpP*KugK%b_G2)veeh(>NPrBNj6<
+z`zyJ#ZUYj~R0{bQs$U8<&4-%qWfnuNzXo@GI&AN0y&tiI?SG1}t!*jPIv;9%Zc+fa
+zv!he|Lhh}qNTU**+0EcAlVU@7SW23*dEuetLG8nL1I9{_`{tkWYM6Ht;Z@`)526G<
+z0suvDB-AEsJ3AD@U&Bd}BX>Bu_HaLIMpH?)4&ehX!d~UG^lQx2uBW(ZY2&GQJZ<So
+zE7Mkq_NJQ~5c&2s%D4A^%jf-e_~_SdkGk#NA)B6e`5d07;d^Z}Z!FS7o3QxHe^~)N
+zhzy|u-Xgop&4<?zOQ*I}=}M=zRNYFa$|~ARRk?Z#r%F^ZYD%YSD$u~fw8kuCzH8o@
+zHA+zH&2K6DgHevk?MSCnDI?#FT{@UD7}qV9zl+1__mWqc9=EPe^F8kPjGocCkxHAf
+zC#bS+ng45bbyblIbjBRx_|D-?*zCt<ZPlrB`CNS9VWDoQB(J}MCB>Xs!_<b^12c`Y
+zlQwPl6}K>#v1wQNT+7V9`?WSbvh}&WvlnKX?$_J2ZLK!F@|p0-P=zXCo_}{V*dG$V
+z56S(ztD;J^Lp3d_Czz%=HJX-48R<CogPMjfo5Bj;h1g&&^1awJV{;Ij!}#U_H{IMa
+z&8u-18`L?o1pu<JEJ*SxvK$oT0kTYq+)tJRf_!+H3bL|7soYpNkEif!5_&ADX-cg_
+z)5(~H7vKc-7#~f?4A!ns#L6xX8S3l3L-FO?ubZs!8Tf>DBy`7-F#cCM^mrlA6Z}~5
+z&27E~08d3i$S+X$1THVa<!6B=(s+AnsjhjxuK5`>k;bPd2}r@)nV-e*W2ye;nU4oQ
+O8oV|1R0L^{>--;7o|P5=
+
+diff --git a/airguide-assistant/tests/__pycache__/test_assistant.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_assistant.cpython-312.pyc
+deleted file mode 100644
+index 22b4a0cbc667ac1ed7dff3ef4e3c186d38310bfb..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 12477
+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
+H^z{E11h&-q
+
+diff --git a/airguide-assistant/tests/__pycache__/test_cache.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_cache.cpython-312.pyc
+deleted file mode 100644
+index ba9ebdde6b0c250b9dfbe43df48fdc918cd5939b..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 3324
+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
+
+diff --git a/airguide-assistant/tests/__pycache__/test_cli.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_cli.cpython-312.pyc
+deleted file mode 100644
+index 6157c4d7d141ceaf560423dfa70ef6b91a049268..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 3444
+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
+EKg5pNDgXcg
+
+diff --git a/airguide-assistant/tests/__pycache__/test_router.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_router.cpython-312.pyc
+deleted file mode 100644
+index 17080c727c4bc88cc7a88f5b466868a0410cec0b..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 5226
+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
+
+diff --git a/airguide-assistant/tests/__pycache__/test_server.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_server.cpython-312.pyc
+deleted file mode 100644
+index fc81f58346cc5b7400583120ca485c4618cf7cd1..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 7887
+zcmcIpZEO>1et%}hV~^u;V&{d#EU*p^kV%5WatTYay9MF|$SnjGvUgx@@l8AvGR80A
+znK59Wx#QaO8cs++RUJWhClVEjP^d_yO65a8Y++AA>X&$9<aD6ARbM{vElW`M#7b55
+zf5u}w!8x`%^&jQ&GtcWh|L6CAoqusUs}MryzrXmO$YUo${{assv4zU=bA-?hBq524
+zqM-3h1u61O2Wj%l1TEy3CBJmk8nXp$6pUq}T+AM{le#5Z6>|g~F+RvsNMa{Y&`F~M
+zNU}~K$tKg04d&J*y2lvxU=10`O(4nsmXR*mEmfUqMF`i@NTwq#rPWNjSEx`ZMWrag
+z@dBQQ1WK<P9>cOIDe=<>hlh_Im+?6n-=%cNA?2KW%;*qk-EmCR<U>kK(PXSUN0LfZ
+z3XO?zDJtVIW$u9xvLb}w{g*cp4r;|diIQlEku3Kt#^~cnV29FtzZ@M?I=q8%NfBSn
+zB7{yG-NSp0$|Z3xh8Y5-Tf&N#Qei>w>v~OAHT5$nLn?V?|9DEbM3r+g<`F{huht=i
+zE}`d+b=Q6}t<Lt(ZCP;ap115?h8@DjHU`m!-{l~AX&J#)2Wg24G7=rM$gIRn6d4$_
+z%B*B5d$y5l<s^q>ouGnt$u@z4Rd8)Vhh(2XL0+nYYfsSvuR9F>4#V5;A6mgVhsn7)
+z8n9<y!8@&h352u){}7UB&1Rm0aJF!a`>cr|vn7K<rCHVtig4z<5=DqqtR%_iK?wZ{
+z{f5q<5Zo*wt;VcHTxP9AYph;d8ex*e-M5=>c#+Cbkp{D;L?zT}>&(_jlUXZK<egI8
+zqzsAx3|5g;l?L89?(^o}-RL5nsVIq(lgN}!;xZ^yJhepr%-Ix5As>1VsnmIzLMIVL
+zS}rgr(Rs>;G_Se6wz*g<ouq=CMz)&cN;Jx}ApCs_NpKIv_o&Qi++|;*CnA(qG^xbj
+zc#RKfZDxB5!VH`yZaH5#i?jkoCsB(0o4rEykU*#H@9liwzr(-7{~iV`?tcOL^u>oD
+zzKmW4!WkNsweXm3OR91x8jb0;sG(BQ?lDap@9pd?uF(4eBz;(*b*m=g)3T;pB~gwg
+z;%TmPOctZsSh}Dpmi7pgZqt;QoJeXfp1^MFFvtrA@gV8|19){7_K@^yLt%tONy4(K
+z>Xs2vm36yjszKdqXhhvf28KoxSUx9XomDjvYq~Xwqfuo<w_*8gQdTwHmc-G-xE$B5
+zswQelRd=b0@EKVPiRVNmDvm^Dz2>NlV~VOOiTD7<39Q?W95*VgOrE(<j~y}^_`=(T
+zqX~GcfeT@ITvHNpfzg?8RMja>r?3jg^Lo7)l!jiV%G#&nfvBje>2+la#$Rf$2YuK;
+zfj(Taxb4l)o7xv$-rL*%sq0BY?nHQAlIKq=3nwDE&1aSw+EYClxH7n8MeEyVzxSZ$
+zZcn~FkZliqzAxLpf4=R&eB;5%z?Fl~U7ozln{|0-nFsc}_I&G}Z0nvUmYnPG<i17T
+zdG)~M16Ky0yBlw8y1psz-j;Q5n`Itwce%OVZ0kp#tMl${Irqm;&Mwx~-`IV9_muiq
+zdluU}uLW}Tt>3Vy_7IhKf1GuH{Ov0%a(iz#-rxG5<8DX3ZBMps&wS0^m&j&sUi7t2
+z26DW2v8MKF>KCacnsIv;>l<$jULVZYw`J?wp4NB#{&}PKC8FG(f30s?Vko!g^;a9b
+z*O*`0zjh#(XNk4hn_sKL2%$gg>kjzPqxTyFjm+a}F5p9t8`*%@_ILvWbuTG>9}F}w
+zU%b1%znA`^hk|;qeZb28mZ1k4nBTG#)U8!euZP|h3LZp)n8u$IE0aMHQ`*W1cUNwY
+z6b(R$O2WIw9MhdCqtcudN+E$75*Q4+Q|HvNq$VZK$8kF`w|F~1hFDtzWll{Naev}`
+z+yI)V9B3=LK+ULrVtc=GRA24+Mb9E%b9M0YV4mNU<u}27na`WE{N|^8%My$D2J8g0
+zT=W+T%pwfi`v(}N)@CX)N22Z()&dQkLIORM?mm<Vi&1Yhkr*El!)LsPoT^?ds~T3q
+znk;#hxK|rfRIeOAr{F|9CdV~_#-NjRPCcWHgXO+U=@wOvj+S$WC9;-wmve<Qbpkgw
+z5^gNk)a7ehzN~3k<Xu+}Up_p){*$Ntu_Xq%wit&mzvH4K_3sq816uJ8Bc``fMwM<l
+zgCa$fT_TAB^OvC{Izuaz#N01BWEUCx+jg;+)-fr=m~8Gw7cCh}B{xEYn<W&fHftry
+zSR(GylSw8{&DBTgFu2`FDl@#t|B&G|7ebX>j|k|)Rn&rT&qX%FMvCUSL~l6(`(00P
+z5=rPH`xEwf;rBdMG@$HI+TJOSE1lsnQA_iIL|l{O+V<hpxU5@_9yvZNFuFw&HBq;X
+z$)Y4<Rky}uZ7d-PJO<wa`v9c2V}@12067f)1>OSfmWY~&>ufY3N~&%FhaZES>UMDY
+z4a;K*CnQ<0;`hn;k%W}e*{}xtGgv;00mwQfs{kr5Aww@%#uKWRc9jDkTD}Lk|69WY
+zudcruzZ}n3w`8jc_6IKyPC2r?Z?@&(rY8;ayN}GDIJLx}nk~zSuBn=2maG>0j#ZW;
+z=kA!J78{#xT)2MWcKx08GwWyfJ=lMD|Gk3?&E4~j-QO^%c6;94@uj=t+yAU-xSF|~
+z$=7Vj)@*r+DEkgDGP|zt`gPZ>-kZJC;+@f%(Z3m6c&Br|uJbA1`Rx)z*>}8FKR^im
+z!@GS==%4F4`*`LNZSQMBk9fAP!S=|_K)r#KO&bG#=25plATW=8RKU+X7TAD)rM551
+z@2UR>`8B1Y8ysg;NiHQiLq)(lSVg8>MT#<6BD1gL+ODxSlc6d}vSfj9Va4nUlD)=U
+z7UoLU((KjJzP6h!*oJhfQ|I<6_&`#T<aDhhkBZ5twq3<x?>11?+tQ7uL>-sINvvq8
+z?MD+)C7epHJF(sD0%6;Jgt%L(Zi^?>xH38_*h}JN2o#8x&WWljV{I^w_rar8l0keh
+zIJ>&T=o>hj6r%!71d51{3aZ=m+8T}ERTDKO91`PFs36v9U%4o)G3X<Zt_y~AIqR;T
+zx_m0{^ktpC>Ha%|GlO%?%#ob4>mgMzG*fLR<nJVA5(``3&+)s9Hpo9m{iFTw?eo3I
+zvpa@!{HKe&E6;Dp@*Ac;xpng9$@y)2vK#k)F68(_-`G%fci!2Rb#}d0A+-9tecStd
+z%p)J$*I`>>xxw)!mU|}wzeM$;Km9o}z*=tM3#1iITBI1KmZ*{$D-!^^Y<8u%wt^5;
+zjtn!zG@2`u?9B>ulR=SU>{X(l(v_m%N=8SbOW?jTX{i9{D?5$2QDBAyCe3!n6XSBa
+zzSF=+r{CXMOm(E4@OW%sU;p6&e@s&TnnFmZ(s=`T$3#VyRRgx5<#C^BA4&kmM*yjI
+z*^Do6fP`s=_NT^mIviUWWo#u-OvcZ|6X)ZhaZwu!b?xXP$c-mL8WzvVSQVq`oo~SR
+zt#e>&6{5LI=$Sh(xo^?kkaus+x;Nk6b?3vG5A(jBtgk2M?tM7&+_mmT_4Vq!YiriE
+zby~ZVnn}&QH*+!PBKrS>uZq|`cI&g7pXE3Dvm5<$%u~MWYa6QVr+(+|op<-XRsj<a
+zw)Z*NM^3hHoxL)4e{Xu7l@MEW)hZ!Yf=nU(Yudz8q?o5EQBm0zR{x9!`M5||R=F8U
+zVoK;)V+?I5;5Sw2n&U}+N8*U;E#_jtUlyu{(!8i(@P|o?PM~#LOjcF#v`hkFO~&g1
+zKsGfQi-|a;GvZkVgM)}qLOUm(7Zpv3pVl3!99I=hIj3kTfyD=5$Q~HNO3B!`s$1na
+z(VT!s!N4DJS#Up~0{C1EbV=4P1P)RNCz5d~q+w+|?R^7qt40jMLUF?dZ+z!Q>Uzp>
+zARboFfAVRz;|B}PKg>6u$~K=`X#UYcqj;I0v|h6;a(td^%5qIp>!#~++?LXF{giU^
+z-Pwk$r*p0@$90!?oW8knI-T|GoICuK>w7bx0rf=GBBVucz_nC>*4x4vi6+;z5)R*a
+z9jzD>R#K~yMPij=;8e-4SPk1h?rkKiWV_Fqz%Hy+2E_jphpHq;nngtgURbS|<|D9n
+z4yj;aemo*dBt@lMqY%O;0F&UV5Ci?=i|Hy&zMyrEM@1zrP<Q|#q}-wqS_U>>P+ENm
+zDZc@Y%M#R<FpW>aN+BqA!E!LZ;3lsl>hqi!RU{GeIU$nxQPZ2>K<^u4Kr+-R1HVO7
+z*5C5n^i03M;Ax-Tm-YDPm>k!&s`qx+o!*(=+0?`4+4zF*qr9&_>+4_e?O*U5ctT}8
+z-+vOwaYt9pneLwBr#uUuj~<Fy&)&~{Id1>z5nZz_GaoE?I_D@rdf+Lyn;>1F(k^j)
+zJgS7r`8pxs5UO=96pD*6ITX^XLZMhfN=Bj1heF^S89gMtHnI?oFl4cexCZY4K0+LU
+zcSAum$5E*L0E!<$0crfZi0n_I5eycZ6p)%Gd7TNg*tlWdQoqQ%E)9Iey1u4s+2&;i
+zS=~!eTWUpC_t!MTZYi`e?3R~RG<%#{<~Vl8%X$lYn0m=u*ls8S)G}{jdyEZXuNB`B
+zOetK3Z1;__?+6np$fRh2(OqSqQOHMt6{e>cGmIKBgSj60cw$Nk@%W48r$ia5QWl{6
+z!+>dOs5NxVnk%s8-YZt9VAR%JfvUK|cRz*ok6wY1Y;V3p3JKiM3-CT)z~>L05{Xv8
+zkOI)Dkr$9A5G+RaxXSRYhH+BXSuq+-oHzaa{bE#=3x2*%<LC-E-$UenB$^1HQA668
+z91meRoB&@b-L@JGhPPj7><<CWe_rtSo2J}TeGATaC+S6wzgly-W{SSW-Q=e0rp1M(
+z)*L6S-CQtfwYQpXHck7c&n|d`9M`t?_!X;<EHnvExi$j+A;E$rkTn^KQ7Dp7j6ngh
+zr6G=x;v@x#tO|&kK+Ck1Z8ye1H)x2MsKi4dp^i8P7(N~9Tr#d`z&o8c67GJYFo{#E
+zR~MSh6ubj6`+mbaCaHhDUR3aD2nPL-GYP4QBo50MjGtap>?%wEu`7Km&^ZvyfT+rb
+zG9gERqv{rT%~dDVxepDc_9ytK2oVjSf=*asD2jT99M6#J8LD}P>Yky7e?#s6g*twR
+zcD=MxRL?6eKv6x{TJyEOY_0DVf~Qx9XdBgj?Lxk>HQU(w3fZXkrFvxHC(~ato<)oM
+V(!swx{IkP<ab$@>mi2^%{|jNUKFk0B
+
+diff --git a/airguide-assistant/tests/__pycache__/test_server_efficiency.cpython-312.pyc b/airguide-assistant/tests/__pycache__/test_server_efficiency.cpython-312.pyc
+deleted file mode 100644
+index 52e6c7486e22e0caa8964f783f2c9fa0bd13bd7c..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 2185
+zcmb7FO>7%Q6n?Wm_QqW|f1;E$ts(@4Mc8Q-XhlUKX;LMX>O_!KsFtJE$}>sVU9Zi|
+zxW<+(6)6>oRH;3Is|GbkqvQZ5t{`#a(ljoKmP#DpQi($#J@o>bwYN^CG=lG7zuEa_
+z-kUe?d-HQN8UX-!`r|*DKV^X5#UOy%GIlrsd<7UVav&-GB?o1tq?DDDG6D(40m}=3
+z6#^M8Slq^{+_aM_31Ri>n*g*&0s@(XZBBsImVuyzO2`O37UM}n@}ko-BQqC9&5`Np
+z^E1=lfsZXtF4|d}6PgYd3!v6u=dd3$fh59^lrUO=q>QBnNGc`SP`sC>3B5+>`MEhe
+zZ4)<Lnjws{bg*0?1OOuR9gM{BE0Ebe+X6;h3hdREg<iy!{s&jyi_2T71js0X*EWLW
+zjlt|E04WKeic&H_RjSHWr2?67n;U?41Xe{_ZJiG*&z<Bzz-XhQWTNd+0IUW(e1>Q@
+z60FW(u8lS;U?aGBS%DH5p-B%7mJbdxZgD$3Xyx<q3@djBW5!DkiKiK(BGDdt)zCc6
+zVvJCJ!KETKo@#TFWnQ%Tb(|856Y9whalJ_M+YBubFT%J*IV;-yil-45`<9`43M0;(
+zr_x-36EB?3xtzG%Q`5YZC!RvMHP3`71_YkwM$e=!F+y3&vfT6)%ZZmPY+Xx@5q6d5
+z@~KHu9GJ^Fn9!7E)A@ppNz7u*X54c5UZ1!qLI2lees!AUS$W3uCGQPEFq_FS#c4P*
+z^OQI_3lnUL!<c@E<+FPhcl<vt7j@5W0Kj$F()3%=rReSS^4W%Fv_|(29bbz!v{TQ9
+z#@gA2_THn|na$YndTjWY*tvDxSUkVpYup~MU0NC2(z`bGW9#~{WwvtqZl(TFLm%AI
+zyKYS_P1VNkP2HKQk8bpzc+fxo?acSH-_8CowDIovLw({e72>04M^w&px)e9y>+&^U
+zm;9M3F~ZWC9Mo<Vwbg=^pw`A<_OMVy1!aQvwhLITNO$3D35V9g!9ECX_9;Tq`>O|K
+z{6_jb0<TzW@Ad-E9XPVvX9f0B*e<p1@9#j{UkMC-^05eRz8T#1hlb>-j%c1<sA#)5
+zSG0fX04Rskj!j%1Yw<1*8_1L0T+zNC1}H~dQj9ejErLD#7z2P2rlJ{nDz)5s;;EM7
+z<cd@W04kb<r<zx6&I0{iB#ap{?G`g(KL|oSWHWK20|Nu}keC?oOO;xjm@SH#CD|M;
+znQ4buZXsVjwNHufvrarY?3!QOk9v--oU5}&&(LD{kM2Xa`Iko)N4E6dTZyGaZG2^9
+zWvCXbUs_B&)Q7fZ=sCI_f{y5>*0-+pEf3X-_o{cQ8%JVw-q79=Q(eALoVvOgZD?_!
+zjn1XcWw|zfFL5WaarmwJ=tJ!U6|d5yp?aEWx>lB$rWY~IYz`M3Ve6*(X~A-uGxTMV
+z!Pf!c8}Qfpsi8uh{*NeMCK9{=e@h|t0@~?{s3)6DK@vW)mhGCRXp;rk<|3(HXV8n{
+z%^u_T&E^Ga;td?N7->2=E;dob7Ss?<MeNP%(cW){`~e+oJ-O^O0Bp+$p<ki%H#qeq
+u)Qe8mCN}$H>;17O(2GuPzYU7MSbiYCvZZuipZFs2dE&;@whT(2zwy5TeEG=$
+
+diff --git a/airguide-assistant/tests/test_live_api.py b/airguide-assistant/tests/test_live_api.py
+index 93cdf0e..31f08e3 100644
+--- a/airguide-assistant/tests/test_live_api.py
++++ b/airguide-assistant/tests/test_live_api.py
+@@ -83,6 +83,13 @@ class LiveApiTests(unittest.TestCase):
+         body = self.post({"message": "hello", "state": None, "coords": {"lat": "x", "lon": 999}})
+         self.assertIsNone(body["live"])
+ 
++    def test_saved_profile_skips_sensitivity_question(self):
++        body = self.post({"message": "air quality in Delhi", "state": {"sensitivity": ["lung"]}})
++        self.assertEqual(body["state"]["awaiting"], "activity")
++        self.assertEqual(body["state"]["sensitivity"], ["lung"])
++        body = self.post({"message": "air quality in Delhi", "state": {"sensitivity": ["bogus", "heart"]}})
++        self.assertEqual(body["state"]["sensitivity"], ["heart"])  # unknown groups are dropped
++
+     def test_chat_without_live_has_null(self):
+         self.assertIsNone(self.post({"message": "AQI is 40", "state": None})["live"])
+ 
+diff --git a/airguide-assistant/web/app.js b/airguide-assistant/web/app.js
+index 55ededd..0bf0734 100644
+--- a/airguide-assistant/web/app.js
++++ b/airguide-assistant/web/app.js
+@@ -21,7 +21,32 @@
+   var liveLabel = "";
+   var lastLevel = null;
+ 
+-  var state = null;
++  var PROFILE_KEY = "airguide.profile.v1";
++  var ALERT_KEY = "airguide.alert.v1";
++  var GROUPS = { lung: "a lung condition", heart: "a heart condition", child: "a child", elderly: "age 65+", pregnant: "pregnancy" };
++
++  // localStorage can be unavailable (private mode, blocked): never let it break the app.
++  function store(key, value) {
++    try {
++      if (value === null) localStorage.removeItem(key);
++      else localStorage.setItem(key, JSON.stringify(value));
++    } catch (e) { /* ignore */ }
++  }
++  function load(key) {
++    try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
++  }
++
++  // Opt-in: only the health profile (sensitive groups) is remembered, never the location.
++  function savedProfile() {
++    var p = load(PROFILE_KEY);
++    if (!p || !Array.isArray(p.sensitivity)) return null;
++    return p.sensitivity.filter(function (g) { return GROUPS.hasOwnProperty(g); });
++  }
++  function seedState() {
++    var groups = savedProfile();
++    return groups ? { sensitivity: groups } : null;
++  }
++  var state = seedState();
+   var ttsEnabled = false;
+ 
+   var VERDICT_LABEL = {
+@@ -120,6 +145,89 @@
+       .catch(function () {});
+   }
+ 
++
++  // ---- Saved health profile (opt-in) ----
++  var rememberBox = document.getElementById("remember-profile");
++  var profileSummary = document.getElementById("profile-summary");
++
++  function describeProfile(groups) {
++    if (!groups) return "";
++    if (!groups.length) return "Saved: no sensitive conditions";
++    return "Saved: " + groups.map(function (g) { return GROUPS[g]; }).join(", ");
++  }
++
++  function persistProfile() {
++    if (!rememberBox || !rememberBox.checked) return;
++    if (state && Array.isArray(state.sensitivity)) {
++      store(PROFILE_KEY, { sensitivity: state.sensitivity });
++      profileSummary.textContent = describeProfile(state.sensitivity);
++    }
++  }
++
++  if (rememberBox) {
++    var existing = savedProfile();
++    rememberBox.checked = existing !== null;
++    profileSummary.textContent = describeProfile(existing);
++    rememberBox.addEventListener("change", function () {
++      if (rememberBox.checked) {
++        persistProfile();
++      } else {
++        store(PROFILE_KEY, null);
++        profileSummary.textContent = "Profile cleared from this device";
++      }
++    });
++  }
++
++  // ---- AQI threshold alerts ----
++  var alertToggle = document.getElementById("alert-toggle");
++  var alertSelect = document.getElementById("alert-threshold");
++  var alertCfg = load(ALERT_KEY) || { on: false, threshold: 151 };
++  var alertedNow = false; // already alerted for the current excursion above the threshold
++  var lastLiveData = null; // latest reading, so changing alert settings applies immediately
++
++  function renderAlertControls() {
++    if (!alertToggle) return;
++    alertToggle.setAttribute("aria-pressed", alertCfg.on ? "true" : "false");
++    alertToggle.textContent = "\uD83D\uDD14 Alerts: " + (alertCfg.on ? "On" : "Off");
++    alertSelect.value = String(alertCfg.threshold);
++  }
++
++  function checkAlert(live, idx) {
++    if (!alertCfg.on || live.aqi === null || live.aqi === undefined) return;
++    if (live.aqi < alertCfg.threshold) { alertedNow = false; return; }
++    if (alertedNow) return;
++    alertedNow = true;
++    var text = "AQI " + live.aqi + " (" + CATEGORY[idx] + ") in " + (liveLabel || live.place) +
++      " has reached your alert level of " + alertCfg.threshold + ".";
++    addMessage("AirGuide", "Alert: " + text, "bot");
++    announce("Air quality alert. " + text);
++    try {
++      if ("Notification" in window && Notification.permission === "granted") {
++        new Notification("AirGuide air quality alert", { body: text });
++      }
++    } catch (e) { /* notifications unsupported */ }
++  }
++
++  if (alertToggle) {
++    renderAlertControls();
++    alertToggle.addEventListener("click", function () {
++      alertCfg.on = !alertCfg.on;
++      alertedNow = false;
++      store(ALERT_KEY, alertCfg);
++      renderAlertControls();
++      if (alertCfg.on && lastLiveData) checkAlert(lastLiveData, levelIndex(lastLiveData.aqi));
++      if (alertCfg.on && "Notification" in window && Notification.permission === "default") {
++        try { Notification.requestPermission(); } catch (e) { /* ignore */ }
++      }
++    });
++    alertSelect.addEventListener("change", function () {
++      alertCfg.threshold = parseInt(alertSelect.value, 10) || 151;
++      alertedNow = false;
++      store(ALERT_KEY, alertCfg);
++      if (alertCfg.on && lastLiveData) checkAlert(lastLiveData, levelIndex(lastLiveData.aqi));
++    });
++  }
++
+   // ---- Live conditions panel (real-time data) ----
+   var CATEGORY = ["Good", "Moderate", "Unhealthy for Sensitive Groups", "Unhealthy", "Very Unhealthy", "Hazardous"];
+   var SVG_NS = "http://www.w3.org/2000/svg";
+@@ -203,6 +311,8 @@
+     document.getElementById("live-updated").textContent =
+       when + live.provider + " \u00B7 auto-refreshes every 10 min" + note;
+     lastLevel = idx;
++    lastLiveData = live;
++    checkAlert(live, idx);
+     livePanel.hidden = false;
+     if (!liveTimer) liveTimer = setInterval(refreshLive, LIVE_REFRESH_MS);
+   }
+@@ -210,6 +320,8 @@
+   function hideLive() {
+     livePanel.hidden = true;
+     lastLevel = null;
++    alertedNow = false;
++    lastLiveData = null;
+     if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+   }
+ 
+@@ -281,6 +393,7 @@
+           return;
+         }
+         state = res.body.state;
++        persistProfile();
+         addMessage("AirGuide", res.body.reply, "bot");
+         updateStatus(res.body.summary);
+         announce("New guidance received from AirGuide.");
+@@ -330,7 +443,7 @@
+ 
+   if (resetBtn) {
+     resetBtn.addEventListener("click", function () {
+-      state = null;
++      state = seedState();
+       hideLive();
+       status.textContent = "No reading yet";
+       status.className = "badge badge-none";
+diff --git a/airguide-assistant/web/index.html b/airguide-assistant/web/index.html
+index 536e3d3..dcc2fa9 100644
+--- a/airguide-assistant/web/index.html
++++ b/airguide-assistant/web/index.html
+@@ -60,12 +60,31 @@
+         <figcaption>Forecast: next 24 hours (US AQI)</figcaption>
+         <svg id="live-chart" viewBox="0 0 480 116" role="img" aria-label="Hourly AQI forecast for the next 24 hours"></svg>
+       </figure>
++      <div class="live-alert">
++        <label for="alert-threshold">Alert me when AQI reaches</label>
++        <select id="alert-threshold">
++          <option value="101">101+ Unhealthy for Sensitive Groups</option>
++          <option value="151" selected>151+ Unhealthy</option>
++          <option value="201">201+ Very Unhealthy</option>
++          <option value="301">301+ Hazardous</option>
++        </select>
++        <button id="alert-toggle" type="button" class="btn-control" aria-pressed="false">&#128276; Alerts: Off</button>
++        <span class="live-meta">Works while this tab is open.</span>
++      </div>
+       <div class="live-foot">
+         <span id="live-updated" class="live-meta" aria-live="polite"></span>
+         <button id="live-refresh" type="button" class="btn-control">&#8635; Refresh now</button>
+       </div>
+     </section>
+ 
++    <div class="profile-bar">
++      <label class="profile-label">
++        <input type="checkbox" id="remember-profile">
++        Remember my health profile on this device
++      </label>
++      <span id="profile-summary" class="live-meta" aria-live="polite"></span>
++    </div>
++
+     <!-- Quick Action Scenario Chips -->
+     <section aria-labelledby="chips-h" class="quick-scenarios">
+       <h2 id="chips-h" class="sr-only">Quick Test Scenarios</h2>
+diff --git a/airguide-assistant/web/style.css b/airguide-assistant/web/style.css
+index bfda3e5..b84d873 100644
+--- a/airguide-assistant/web/style.css
++++ b/airguide-assistant/web/style.css
+@@ -435,3 +435,14 @@ button[type="submit"]:disabled {
+   flex-wrap: wrap; gap: 0.5rem; }
+ .chip-geo { border-color: var(--accent); }
+ #live-chart .axis.first { text-anchor: start; }
++
++/* ---- Saved profile + alerts ---- */
++.profile-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin: 0.75rem 0; }
++.profile-label { display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; }
++.profile-label input { width: 1.1rem; height: 1.1rem; accent-color: var(--accent); }
++.live-alert { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0 0 0.6rem;
++  padding-top: 0.6rem; border-top: 1px dashed var(--border); font-size: 0.8125rem; }
++.live-alert label { font-weight: 600; }
++.live-alert select { font: inherit; padding: 0.3rem 0.5rem; background: var(--card-bg); color: var(--fg);
++  border: 1px solid var(--border); border-radius: var(--border-radius); }
++.live-alert [aria-pressed="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+-- 
+2.43.0
+
